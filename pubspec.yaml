@@ -1,0 +1,29 @@
+name: molesignal_flutter
+description: Official MoleSignal Real User Monitoring SDK for Flutter applications.
+version: 0.3.0
+homepage: https://github.com/molesignal/flutter-rum
+repository: https://github.com/molesignal/flutter-rum.git
+issue_tracker: https://github.com/molesignal/flutter-rum/issues
+
+environment:
+  sdk: ^3.9.0
+  flutter: ">=3.35.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.6.0
+  shared_preferences: ^2.5.5
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+
+topics:
+  - observability
+  - monitoring
+  - rum
+  - errors
+  - performance
+  - session-replay

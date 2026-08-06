@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0
+## 0.1.0-alpha.1
 
 - Add stable application/service/version/platform/architecture/debug-ID build
   identity to every session, action, resource, error, and replay event.
@@ -22,8 +22,6 @@
   credentials, sensitive query values, and developer-machine paths are not
   recorded.
 
-## 0.2.0
-
 - Add sampled Flutter session replay that is playable by the existing rrweb
   player, using full snapshots followed by incremental image mutations.
 - Mask all Flutter text and editable fields by default, with explicit
@@ -35,8 +33,6 @@
 - Add per-view Flutter time-to-first-render metrics and retain slow-frame
   reporting under the Web-compatible `trackLongTasks` option.
 - Add manual replay start/stop controls and a Web-to-Flutter capability map.
-
-## 0.1.0
 
 - Add MoleSignal session, action, error, and resource ingestion.
 - Add Flutter and platform error capture.

@@ -1,0 +1,40 @@
+name: release
+
+# After the first manual publication, configure pub.dev automated publishing
+# for molesignal/flutter-rum with the tag pattern v{{version}}.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  validate-version:
+    name: validate release version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: verify tag matches pubspec version
+        shell: bash
+        run: |
+          package_version="$(sed -nE 's/^version:[[:space:]]*([^[:space:]#]+).*/\1/p' pubspec.yaml)"
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          if [[ -z "$package_version" ]]; then
+            echo "Unable to read the package version from pubspec.yaml" >&2
+            exit 1
+          fi
+
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Release tag version ($tag_version) does not match pubspec.yaml ($package_version)" >&2
+            exit 1
+          fi
+
+  publish:
+    name: publish to pub.dev
+    needs: validate-version
+    permissions:
+      id-token: write
+    uses: dart-lang/setup-dart/.github/workflows/publish.yml@v1

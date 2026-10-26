@@ -34,7 +34,7 @@ data.
 
 ```yaml
 dependencies:
-  molesignal_flutter: ^0.2.0-alpha.1
+  molesignal_flutter: ^0.2.0
 ```
 
 Device brand, model, OS version, battery level, and connectivity are read with
@@ -402,5 +402,5 @@ tests are skipped with that message.
 
 ## Upgrading from 0.1
 
-0.2.0-alpha.1 has no compatibility with the 0.1 protocol; see the
+0.2.0 has no compatibility with the 0.1 protocol; see the
 [changelog](CHANGELOG.md) for every breaking change.

@@ -13,7 +13,7 @@ Future<void> main() async {
       env: 'development',
       version: String.fromEnvironment(
         'MOLESIGNAL_VERSION',
-        defaultValue: '0.2.0-alpha.1',
+        defaultValue: '0.2.0',
       ),
       buildVersion: String.fromEnvironment('MOLESIGNAL_BUILD_VERSION'),
       architecture: String.fromEnvironment('MOLESIGNAL_ARCHITECTURE'),

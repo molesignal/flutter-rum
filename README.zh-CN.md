@@ -34,7 +34,7 @@ raster、刷新率、慢帧/冻结帧与内存数据。
 
 ```yaml
 dependencies:
-  molesignal_flutter: ^0.2.0-alpha.1
+  molesignal_flutter: ^0.2.0
 ```
 
 设备品牌、型号、系统版本、电量与网络状态通过 `device_info_plus`、`battery_plus`、
@@ -365,4 +365,4 @@ flutter test
 
 ## 从 0.1 升级
 
-0.2.0-alpha.1 与 0.1 协议不兼容，全部破坏性变更见 [CHANGELOG](CHANGELOG.md)。
+0.2.0 与 0.1 协议不兼容，全部破坏性变更见 [CHANGELOG](CHANGELOG.md)。

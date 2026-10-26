@@ -86,13 +86,10 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
     implements RumReplayCapture {
   final GlobalKey _boundaryKey = GlobalKey();
   final Map<int, _PointerSample> _pointers = <int, _PointerSample>{};
-  final List<_TapSample> _tapSamples = <_TapSample>[];
-  final Set<Timer> _deadTapTimers = <Timer>{};
 
   MoleSignalRumClient? _client;
   String? _sessionId;
   RumReplayEmit? _emit;
-  void Function()? _onVisualChange;
   Timer? _captureTimer;
   bool _captureScheduled = false;
   bool _capturing = false;
@@ -100,7 +97,6 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
   bool _hasSnapshot = false;
   bool _disposed = false;
   int? _lastReplayHash;
-  int? _lastFingerprint;
   int? _lastWidth;
   int? _lastHeight;
 
@@ -141,9 +137,6 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
     _client?.detachReplayCapture(this);
     _client = next;
     next?.attachReplayCapture(this);
-    if (next?.frustrationTrackingEnabled == true) {
-      unawaited(visualFingerprint(refresh: true));
-    }
     setState(() {});
   }
 
@@ -152,24 +145,15 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
     _disposed = true;
     _client?.detachReplayCapture(this);
     stop();
-    for (final Timer timer in _deadTapTimers) {
-      timer.cancel();
-    }
-    _deadTapTimers.clear();
     super.dispose();
   }
 
   @override
-  void start(
-    String sessionId,
-    RumReplayEmit emit,
-    void Function() onVisualChange,
-  ) {
+  void start(String sessionId, RumReplayEmit emit) {
     if (_disposed) return;
     final bool changedSession = _sessionId != sessionId;
     _sessionId = sessionId;
     _emit = emit;
-    _onVisualChange = onVisualChange;
     if (changedSession) {
       _hasSnapshot = false;
       _lastReplayHash = null;
@@ -188,7 +172,6 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
     _captureTimer = null;
     _sessionId = null;
     _emit = null;
-    _onVisualChange = null;
     _captureScheduled = false;
     _captureAgain = false;
     _hasSnapshot = false;
@@ -229,23 +212,6 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
     });
   }
 
-  @override
-  Future<int?> visualFingerprint({bool refresh = false}) async {
-    if (!refresh && _lastFingerprint != null) {
-      return _lastFingerprint;
-    }
-    if (_capturing) return _lastFingerprint;
-    final RenderRepaintBoundary? boundary = _boundary;
-    if (boundary == null || boundary.debugNeedsPaint) return null;
-    try {
-      final _RawFrame frame = await _captureRaw(boundary, 0.08);
-      _lastFingerprint = frame.hash;
-      return frame.hash;
-    } on Object {
-      return null;
-    }
-  }
-
   Future<void> _captureReplayFrame() async {
     if (_capturing) {
       _captureAgain = true;
@@ -264,7 +230,6 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
       final _EncodedFrame frame = await _captureEncoded(boundary, _pixelRatio);
       if (_sessionId != sessionId || _emit != emit) return;
       if (_lastReplayHash == frame.hash) return;
-      if (_lastReplayHash != null) _onVisualChange?.call();
       _lastReplayHash = frame.hash;
       final int timestamp = DateTime.now().millisecondsSinceEpoch;
       final int viewportWidth = boundary.size.width.round();
@@ -460,11 +425,7 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
       position: event.position,
       startedAt: DateTime.now(),
       kind: event.kind,
-      deadTapEligible: target.deadTapEligible,
-      changeId: client.visualChangeId,
-      fingerprint: client.frustrationTrackingEnabled
-          ? visualFingerprint()
-          : Future<int?>.value(),
+      size: target.size,
     );
   }
 
@@ -478,106 +439,44 @@ final class _RumSessionReplayState extends State<RumSessionReplay>
       return;
     }
 
-    client.recordAutomaticInteraction(
-      'Tap',
+    client.recordTap(
+      name: 'Tap',
       position: event.position,
+      explicit: false,
+      targetSize: sample.size,
       context: <String, Object?>{'pointer_kind': sample.kind.name},
     );
-    if (!client.frustrationTrackingEnabled) return;
-    _detectRageTap(client, event.position);
-    if (sample.deadTapEligible) {
-      _scheduleDeadTap(client, sample, event.position);
-    }
   }
 
   void _onPointerCancel(PointerCancelEvent event) {
     _pointers.remove(event.pointer);
   }
 
-  void _detectRageTap(MoleSignalRumClient client, Offset position) {
-    final int now = DateTime.now().millisecondsSinceEpoch;
-    _tapSamples.removeWhere((_TapSample sample) => sample.time < now - 1000);
-    _tapSamples.add(_TapSample(now, position));
-    final int nearby = _tapSamples
-        .where(
-          (_TapSample sample) => (sample.position - position).distance <= 50,
-        )
-        .length;
-    if (nearby < 3) return;
-    client.recordFrustration(
-      'rage_click',
-      'Repeated Flutter tap',
-      context: <String, Object?>{
-        'click_count': nearby,
-        'window_ms': 1000,
-        'x': position.dx.round(),
-        'y': position.dy.round(),
-      },
-    );
-    _tapSamples.clear();
-  }
-
-  void _scheduleDeadTap(
-    MoleSignalRumClient client,
-    _PointerSample sample,
-    Offset position,
-  ) {
-    late final Timer timer;
-    timer = Timer(const Duration(seconds: 1), () {
-      _deadTapTimers.remove(timer);
-      unawaited(_checkDeadTap(client, sample, position));
-    });
-    _deadTapTimers.add(timer);
-  }
-
-  Future<void> _checkDeadTap(
-    MoleSignalRumClient client,
-    _PointerSample sample,
-    Offset position,
-  ) async {
-    final int? before = await sample.fingerprint;
-    final int? after = await visualFingerprint(refresh: true);
-    if (_disposed ||
-        before == null ||
-        after == null ||
-        before != after ||
-        client.visualChangeId != sample.changeId) {
-      return;
-    }
-    client.recordFrustration(
-      'dead_click',
-      'No response after Flutter tap',
-      context: <String, Object?>{
-        'wait_ms': 1000,
-        'x': position.dx.round(),
-        'y': position.dy.round(),
-      },
-    );
-  }
-
   _InteractionTarget _interactionTarget(Offset globalPosition) {
     final RenderRepaintBoundary? boundary = _boundary;
-    if (boundary == null) return const _InteractionTarget(false, false);
+    if (boundary == null) return const _InteractionTarget(false, null);
     final BoxHitTestResult result = BoxHitTestResult();
     final bool hit = boundary.hitTest(
       result,
       position: boundary.globalToLocal(globalPosition),
     );
-    if (!hit) return const _InteractionTarget(false, false);
+    if (!hit) return const _InteractionTarget(false, null);
     bool interactive = false;
-    bool editable = false;
+    Size? size;
     for (final HitTestEntry<HitTestTarget> entry in result.path) {
       final HitTestTarget target = entry.target;
-      if (target is RenderEditable) editable = true;
-      if (target is RenderSemanticsGestureHandler && target.onTap != null) {
-        interactive = true;
-      }
-      if (target is RenderPointerListener &&
-          (target.onPointerDown != null || target.onPointerUp != null)) {
-        interactive = true;
+      final bool handlesTap =
+          (target is RenderSemanticsGestureHandler && target.onTap != null) ||
+          (target is RenderPointerListener &&
+              (target.onPointerDown != null || target.onPointerUp != null));
+      if (!handlesTap) continue;
+      interactive = true;
+      // The innermost interactive box is the one the user touched.
+      if (size == null && target is RenderBox && target.hasSize) {
+        size = target.size;
       }
     }
-    return _InteractionTarget(interactive, interactive && !editable);
+    return _InteractionTarget(interactive, size);
   }
 
   RenderRepaintBoundary? get _boundary {
@@ -730,29 +629,18 @@ final class _PointerSample {
     required this.position,
     required this.startedAt,
     required this.kind,
-    required this.deadTapEligible,
-    required this.changeId,
-    required this.fingerprint,
+    required this.size,
   });
 
   final Offset position;
   final DateTime startedAt;
   final PointerDeviceKind kind;
-  final bool deadTapEligible;
-  final int changeId;
-  final Future<int?> fingerprint;
-}
-
-final class _TapSample {
-  const _TapSample(this.time, this.position);
-
-  final int time;
-  final Offset position;
+  final Size? size;
 }
 
 final class _InteractionTarget {
-  const _InteractionTarget(this.interactive, this.deadTapEligible);
+  const _InteractionTarget(this.interactive, this.size);
 
   final bool interactive;
-  final bool deadTapEligible;
+  final Size? size;
 }

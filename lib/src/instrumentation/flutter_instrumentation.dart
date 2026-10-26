@@ -15,18 +15,19 @@ final class FlutterRumInstrumentation with WidgetsBindingObserver {
   bool Function(Object, StackTrace)? _previousPlatformError;
   FlutterExceptionHandler? _flutterHandler;
   bool Function(Object, StackTrace)? _platformHandler;
-  bool _observingLifecycle = false;
+  bool _observing = false;
   bool _observingTimings = false;
 
   void start() {
     final WidgetsBinding binding = WidgetsBinding.instance;
     if (_configuration.trackFlutterErrors) _installFlutterErrors();
-    if (_configuration.trackPlatformErrors) _installPlatformErrors(binding);
-    if (_configuration.trackAppLifecycle) {
+    if (_configuration.trackPlatformErrors) _installPlatformErrors();
+    if (_configuration.trackAppLifecycle ||
+        _configuration.trackUserInteractions) {
       binding.addObserver(this);
-      _observingLifecycle = true;
+      _observing = true;
     }
-    if (_configuration.trackLongFrames || _configuration.trackViewPerformance) {
+    if (_configuration.trackLongTasks || _configuration.trackViewPerformance) {
       binding.addTimingsCallback(_onTimings);
       _observingTimings = true;
     }
@@ -34,17 +35,17 @@ final class FlutterRumInstrumentation with WidgetsBindingObserver {
 
   void stop() {
     final WidgetsBinding binding = WidgetsBinding.instance;
-    if (_observingLifecycle) binding.removeObserver(this);
+    if (_observing) binding.removeObserver(this);
     if (_observingTimings) binding.removeTimingsCallback(_onTimings);
-    _observingLifecycle = false;
+    _observing = false;
     _observingTimings = false;
 
     if (_flutterHandler != null && FlutterError.onError == _flutterHandler) {
       FlutterError.onError = _previousFlutterError;
     }
     if (_platformHandler != null &&
-        identical(binding.platformDispatcher.onError, _platformHandler)) {
-      binding.platformDispatcher.onError = _previousPlatformError;
+        identical(PlatformDispatcher.instance.onError, _platformHandler)) {
+      PlatformDispatcher.instance.onError = _previousPlatformError;
     }
     _flutterHandler = null;
     _platformHandler = null;
@@ -56,13 +57,12 @@ final class FlutterRumInstrumentation with WidgetsBindingObserver {
       _sink.recordCapturedError(
         details.exception,
         stackTrace: details.stack,
-        context: <String, Object?>{
+        meta: <String, Object?>{
           if (details.library != null) 'library': details.library,
           if (details.context != null)
             'diagnostics_context': details.context.toString(),
-          'silent': details.silent,
         },
-        source: 'flutter',
+        fatal: false,
       );
       final FlutterExceptionHandler? previous = _previousFlutterError;
       if (previous != null) {
@@ -76,30 +76,31 @@ final class FlutterRumInstrumentation with WidgetsBindingObserver {
     FlutterError.onError = handler;
   }
 
-  void _installPlatformErrors(WidgetsBinding binding) {
-    _previousPlatformError = binding.platformDispatcher.onError;
+  void _installPlatformErrors() {
+    _previousPlatformError = PlatformDispatcher.instance.onError;
     bool handler(Object error, StackTrace stackTrace) {
-      _sink.recordCapturedError(
-        error,
-        stackTrace: stackTrace,
-        context: const <String, Object?>{},
-        source: 'platform',
-      );
+      _sink.recordCapturedError(error, stackTrace: stackTrace, fatal: true);
       return _previousPlatformError?.call(error, stackTrace) ?? false;
     }
 
     _platformHandler = handler;
-    binding.platformDispatcher.onError = handler;
+    PlatformDispatcher.instance.onError = handler;
   }
 
   void _onTimings(List<FrameTiming> timings) {
-    for (final FrameTiming timing in timings) {
-      _sink.recordFrameTiming(timing);
-    }
+    _sink.recordFrameTimings(timings);
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    _sink.handleLifecycleState(state);
+    if (_configuration.trackAppLifecycle) _sink.handleLifecycleState(state);
+  }
+
+  /// Observes the system back button without handling it, so the navigator
+  /// still pops its route.
+  @override
+  Future<bool> didPopRoute() async {
+    _sink.recordBack();
+    return false;
   }
 }

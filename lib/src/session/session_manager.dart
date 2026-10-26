@@ -6,6 +6,13 @@ import '../internal/diagnostics.dart';
 import '../internal/identifiers.dart';
 import '../models.dart';
 
+/// Activity is persisted at most this often; restarts lose at most this much.
+const int _activityPersistIntervalMicros = 5 * 1000 * 1000;
+
+final RegExp _identifier = RegExp(r'^[A-Za-z0-9._:-]{1,128}$');
+
+/// A user session. The server derives sessions from `view` events, so this is
+/// only the identity, the sampling decisions, and the replay bookkeeping.
 final class RumSession {
   RumSession({
     required this.id,
@@ -13,20 +20,8 @@ final class RumSession {
     required this.lastActivityMicros,
     required this.sampled,
     required this.replaySampled,
-    required this.reported,
-    required this.replaySequence,
-    this.eventSequence = 0,
-    this.viewCount = 0,
-    this.actionCount = 0,
-    this.errorCount = 0,
-    this.resourceCount = 0,
-    this.crashed = false,
-    this.pendingClose = false,
-    this.finalReported = false,
-    this.endedAtMicros,
-    this.endReason,
-    this.landingPage,
-    this.lastPage,
+    this.replaySequence = 0,
+    this.replayRecorded = false,
   });
 
   final String id;
@@ -34,26 +29,10 @@ final class RumSession {
   int lastActivityMicros;
   final bool sampled;
   final bool replaySampled;
-  bool reported;
   int replaySequence;
-  int eventSequence;
-  int viewCount;
-  int actionCount;
-  int errorCount;
-  int resourceCount;
-  bool crashed;
-  bool pendingClose;
-  bool finalReported;
-  int? endedAtMicros;
-  String? endReason;
-  String? landingPage;
-  String? lastPage;
 
-  int get durationMicros {
-    final int end = endedAtMicros ?? lastActivityMicros;
-    final int value = end - startedAtMicros;
-    return value < 0 ? 0 : value;
-  }
+  /// A replay event has been queued for this session (`session.has_replay`).
+  bool replayRecorded;
 
   Map<String, Object?> toJson() => <String, Object?>{
     'id': id,
@@ -61,20 +40,8 @@ final class RumSession {
     'lastActivityMicros': lastActivityMicros,
     'sampled': sampled,
     'replaySampled': replaySampled,
-    'reported': reported,
     'replaySequence': replaySequence,
-    'eventSequence': eventSequence,
-    'viewCount': viewCount,
-    'actionCount': actionCount,
-    'errorCount': errorCount,
-    'resourceCount': resourceCount,
-    'crashed': crashed,
-    'pendingClose': pendingClose,
-    'finalReported': finalReported,
-    if (endedAtMicros != null) 'endedAtMicros': endedAtMicros,
-    if (endReason != null) 'endReason': endReason,
-    if (landingPage != null) 'landingPage': landingPage,
-    if (lastPage != null) 'lastPage': lastPage,
+    'replayRecorded': replayRecorded,
   };
 
   static RumSession? fromJson(Object? value) {
@@ -84,7 +51,7 @@ final class RumSession {
     final Object? lastActivityMicros = value['lastActivityMicros'];
     final Object? sampled = value['sampled'];
     if (id is! String ||
-        id.isEmpty ||
+        !_identifier.hasMatch(id) ||
         startedAtMicros is! int ||
         lastActivityMicros is! int ||
         sampled is! bool) {
@@ -96,42 +63,19 @@ final class RumSession {
       lastActivityMicros: lastActivityMicros,
       sampled: sampled,
       replaySampled: value['replaySampled'] == true,
-      reported: value['reported'] == true,
       replaySequence: _nonNegative(value['replaySequence']),
-      eventSequence: _nonNegative(value['eventSequence']),
-      viewCount: _nonNegative(value['viewCount']),
-      actionCount: _nonNegative(value['actionCount']),
-      errorCount: _nonNegative(value['errorCount']),
-      resourceCount: _nonNegative(value['resourceCount']),
-      crashed: value['crashed'] == true,
-      pendingClose: value['pendingClose'] == true,
-      finalReported: value['finalReported'] == true,
-      endedAtMicros: value['endedAtMicros'] is int
-          ? value['endedAtMicros']! as int
-          : null,
-      endReason: value['endReason'] is String
-          ? value['endReason']! as String
-          : null,
-      landingPage: value['landingPage'] is String
-          ? value['landingPage']! as String
-          : null,
-      lastPage: value['lastPage'] is String
-          ? value['lastPage']! as String
-          : null,
+      replayRecorded: value['replayRecorded'] == true,
     );
   }
 }
 
 final class SessionResult {
-  const SessionResult(
-    this.session, {
-    required this.created,
-    this.closedSessions = const <RumSession>[],
-  });
+  const SessionResult(this.session, {required this.created});
 
   final RumSession session;
+
+  /// The previous session expired (or there was none) and [session] is new.
   final bool created;
-  final List<RumSession> closedSessions;
 }
 
 final class SessionManager {
@@ -140,35 +84,26 @@ final class SessionManager {
     this._persistence,
     this._storageKey,
     this._session,
-    this._pendingFinalizations,
-  );
+  ) : _lastPersistedActivity = _session.lastActivityMicros;
 
+  /// Restores the stored session, or starts one. A session started here
+  /// begins at [startedAtMicros] (default: now), so that the application's own
+  /// start never precedes the session it belongs to.
   static Future<SessionManager> create(
     NormalizedRumConfiguration configuration,
-    RumPersistence persistence,
-  ) async {
+    RumPersistence persistence, {
+    int? startedAtMicros,
+  }) async {
     final String storageKey =
         'molesignal_rum_session_${_normalizeStorageKey(configuration.applicationId)}';
     RumSession? stored;
-    final List<RumSession> pending = <RumSession>[];
     try {
       final String? raw = await persistence.read(storageKey);
       if (raw != null) {
         final Object? decoded = jsonDecode(raw);
-        if (decoded is Map<String, dynamic> && decoded['current'] != null) {
-          stored = RumSession.fromJson(decoded['current']);
-          final Object? rawPending = decoded['pending'];
-          if (rawPending is List<dynamic>) {
-            for (final Object? value in rawPending) {
-              final RumSession? session = RumSession.fromJson(value);
-              if (session != null && !session.finalReported) {
-                pending.add(session);
-              }
-            }
-          }
-        } else {
-          stored = RumSession.fromJson(decoded);
-        }
+        stored = RumSession.fromJson(
+          decoded is Map<String, dynamic> ? decoded['current'] : null,
+        );
       }
     } on Object catch (error, stackTrace) {
       reportDiagnostic(
@@ -179,29 +114,16 @@ final class SessionManager {
       );
     }
 
-    final int now = nowMicros();
-    RumSession session = stored ?? _createSession(configuration, now);
+    final int now = startedAtMicros ?? nowMicros();
     final SessionManager manager = SessionManager._(
       configuration,
       persistence,
       storageKey,
-      session,
-      pending,
+      stored ?? _createSession(configuration, now),
     );
-    if (session.pendingClose ||
-        manager._expirationReason(session, now) != null) {
-      if (!session.finalReported) {
-        manager._close(
-          session,
-          session.endReason ??
-              manager._expirationReason(session, now) ??
-              'restart',
-          now,
-        );
-        manager._addPending(session);
-      }
-      session = _createSession(configuration, now);
-      manager._session = session;
+    if (stored != null && manager._expirationReason(stored, now) != null) {
+      manager._session = _createSession(configuration, now);
+      manager._lastPersistedActivity = now;
     }
     await manager.persistNow();
     return manager;
@@ -210,100 +132,47 @@ final class SessionManager {
   final NormalizedRumConfiguration _configuration;
   final RumPersistence _persistence;
   final String _storageKey;
-  late RumSession _session;
-  final List<RumSession> _pendingFinalizations;
+  RumSession _session;
+  int _lastPersistedActivity;
   final Map<String, int> _completedReplaySequences = <String, int>{};
   Future<void> _pendingWrite = Future<void>.value();
 
-  SessionResult ensure({bool touch = true}) {
+  /// The live session, starting a new one when the previous one has expired.
+  /// With [touch] the call counts as user activity.
+  SessionResult resolve({bool touch = true}) {
     final int now = nowMicros();
     bool created = false;
-    final List<RumSession> closed = <RumSession>[];
-    final String? reason = _expirationReason(_session, now);
-    if (_session.pendingClose || reason != null) {
-      _close(_session, _session.endReason ?? reason ?? 'restart', now);
+    if (_expirationReason(_session, now) != null) {
       _completedReplaySequences[_session.id] = _session.replaySequence;
-      if (!_session.finalReported) {
-        _addPending(_session);
-        closed.add(_session);
-      }
       _session = _createSession(_configuration, now);
+      _lastPersistedActivity = now;
       created = true;
     }
     if (touch) _session.lastActivityMicros = now;
-    if (touch || created) _schedulePersist();
-    return SessionResult(
-      _session,
-      created: created,
-      closedSessions: List<RumSession>.unmodifiable(closed),
-    );
+    if (created ||
+        (touch &&
+            now - _lastPersistedActivity >= _activityPersistIntervalMicros)) {
+      _lastPersistedActivity = now;
+      _schedulePersist();
+    }
+    return SessionResult(_session, created: created);
   }
 
-  RumSession current() => ensure(touch: false).session;
+  RumSession current() => resolve(touch: false).session;
+
+  /// The session if it has not expired, else `null`. Unlike [resolve] it never
+  /// starts a session, so passive measurements such as frame timings cannot
+  /// keep or restart one.
+  RumSession? live() =>
+      _expirationReason(_session, nowMicros()) == null ? _session : null;
 
   /// Returns the in-memory session without making replay frames user activity.
   RumSession active() => _session;
 
-  List<RumSession> pendingFinalizations() => List<RumSession>.unmodifiable(
-    _pendingFinalizations.where((RumSession session) => !session.finalReported),
-  );
-
-  void markReported(String sessionId) {
-    if (_session.id != sessionId) return;
-    _session.reported = true;
+  void markReplayRecorded(String sessionId) {
+    if (_session.id != sessionId || _session.replayRecorded) return;
+    _session.replayRecorded = true;
     _schedulePersist();
-  }
-
-  void markFinalReported(String sessionId) {
-    for (final RumSession session in _pendingFinalizations) {
-      if (session.id == sessionId) session.finalReported = true;
-    }
-    if (_session.id == sessionId) _session.finalReported = true;
-    _pendingFinalizations.removeWhere(
-      (RumSession session) => session.finalReported,
-    );
-    _schedulePersist();
-  }
-
-  void recordView(RumSession session, String path) {
-    if (session.id != _session.id) return;
-    session.viewCount += 1;
-    if (path.isNotEmpty) {
-      session.landingPage ??= path;
-      session.lastPage = path;
-    }
-    _schedulePersist();
-  }
-
-  void recordAction(RumSession session) {
-    if (session.id != _session.id) return;
-    session.actionCount += 1;
-    _schedulePersist();
-  }
-
-  void recordError(RumSession session, {bool crash = false}) {
-    if (session.id != _session.id) return;
-    session.errorCount += 1;
-    session.crashed = session.crashed || crash;
-    _schedulePersist();
-  }
-
-  void recordResource(RumSession session) {
-    if (session.id != _session.id) return;
-    session.resourceCount += 1;
-    _schedulePersist();
-  }
-
-  Future<RumSession> closeCurrent({
-    required String reason,
-    bool crashed = false,
-  }) async {
-    final int now = nowMicros();
-    _session.crashed = _session.crashed || crashed;
-    _close(_session, reason, now);
-    _addPending(_session);
-    await persistNow();
-    return _session;
   }
 
   int nextReplaySequence(String sessionId) {
@@ -312,32 +181,9 @@ final class SessionManager {
       _schedulePersist();
       return _session.replaySequence;
     }
-    for (final RumSession session in _pendingFinalizations) {
-      if (session.id == sessionId) {
-        session.replaySequence += 1;
-        _schedulePersist();
-        return session.replaySequence;
-      }
-    }
     final int next = (_completedReplaySequences[sessionId] ?? 0) + 1;
     _completedReplaySequences[sessionId] = next;
     return next;
-  }
-
-  int nextEventSequence(String sessionId) {
-    if (_session.id == sessionId) {
-      _session.eventSequence += 1;
-      _schedulePersist();
-      return _session.eventSequence;
-    }
-    for (final RumSession session in _pendingFinalizations) {
-      if (session.id == sessionId) {
-        session.eventSequence += 1;
-        _schedulePersist();
-        return session.eventSequence;
-      }
-    }
-    return 1;
   }
 
   String? _expirationReason(RumSession session, int now) {
@@ -353,40 +199,20 @@ final class SessionManager {
     return null;
   }
 
-  void _close(RumSession session, String reason, int now) {
-    session.pendingClose = true;
-    session.endReason = reason;
-    session.endedAtMicros ??= now < session.lastActivityMicros
-        ? session.lastActivityMicros
-        : now;
-  }
-
-  void _addPending(RumSession session) {
-    if (_pendingFinalizations.any(
-      (RumSession existing) => existing.id == session.id,
-    )) {
-      return;
-    }
-    _pendingFinalizations.add(session);
-  }
-
   void _schedulePersist() {
     _pendingWrite = _pendingWrite.then((_) => _writeState());
   }
 
   Future<void> persistNow() {
+    _lastPersistedActivity = _session.lastActivityMicros;
     _schedulePersist();
     return _pendingWrite;
   }
 
   Future<void> _writeState() async {
     final String encoded = jsonEncode(<String, Object?>{
-      'version': 2,
+      'version': 3,
       'current': _session.toJson(),
-      'pending': _pendingFinalizations
-          .where((RumSession session) => !session.finalReported)
-          .map((RumSession session) => session.toJson())
-          .toList(growable: false),
     });
     try {
       await _persistence.write(_storageKey, encoded);
@@ -406,14 +232,11 @@ final class SessionManager {
   ) {
     final bool sampled = sample(configuration.sessionSampleRate);
     return RumSession(
-      id: generateId('ses'),
+      id: generateUuid(),
       startedAtMicros: now,
       lastActivityMicros: now,
       sampled: sampled,
       replaySampled: sampled && sample(configuration.sessionReplaySampleRate),
-      reported: false,
-      replaySequence: 0,
-      eventSequence: 0,
     );
   }
 }

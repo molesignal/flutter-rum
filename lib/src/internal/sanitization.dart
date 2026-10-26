@@ -47,12 +47,25 @@ RumContext sanitizeReplayContext(Object? value) {
   return sanitized is Map<String, Object?> ? sanitized : <String, Object?>{};
 }
 
+/// Keys whose string values are stack text and may exceed the default limit.
+const Set<String> _stackTextKeys = <String>{'stack', 'handling_stack'};
+
+/// Objects whose keys are names the application chose for a timing or a feature
+/// flag, and whose values are numbers or flag results. A name such as
+/// `token_refreshed` is not a secret, and replacing its value would also break
+/// the integer the contract requires for a timing.
+const Set<String> _namedValueObjects = <String>{
+  'custom_timings',
+  'feature_flags',
+};
+
 Object? _sanitizeValue(
   Object? value,
   int depth,
   Set<Object> seen,
-  bool preserveReplayImages,
-) {
+  bool preserveReplayImages, [
+  String? key,
+]) {
   if (value == null || value is bool || value is int) return value;
   if (value is String) {
     if (preserveReplayImages &&
@@ -60,7 +73,10 @@ Object? _sanitizeValue(
         value.length <= 8 * 1024 * 1024) {
       return value;
     }
-    return sanitizeText(value, limit: 4096);
+    return sanitizeText(
+      value,
+      limit: _stackTextKeys.contains(key) ? 32768 : 4096,
+    );
   }
   if (value is double) return value.isFinite ? value : value.toString();
   if (value is DateTime) return value.toUtc().toIso8601String();
@@ -75,7 +91,7 @@ Object? _sanitizeValue(
         .take(100)
         .map(
           (Object? item) =>
-              _sanitizeValue(item, depth + 1, seen, preserveReplayImages),
+              _sanitizeValue(item, depth + 1, seen, preserveReplayImages, key),
         )
         .toList(growable: false);
     seen.remove(value);
@@ -85,12 +101,20 @@ Object? _sanitizeValue(
   if (value is Map<Object?, Object?>) {
     if (seen.contains(value)) return '[Circular]';
     seen.add(value);
+    final String? parentKey = key;
     final RumContext result = <String, Object?>{};
     for (final MapEntry<Object?, Object?> entry in value.entries.take(100)) {
       final String key = truncate(entry.key.toString(), 256);
-      result[key] = _sensitiveKey.hasMatch(key)
+      result[key] =
+          !_namedValueObjects.contains(parentKey) && _sensitiveKey.hasMatch(key)
           ? '[Redacted]'
-          : _sanitizeValue(entry.value, depth + 1, seen, preserveReplayImages);
+          : _sanitizeValue(
+              entry.value,
+              depth + 1,
+              seen,
+              preserveReplayImages,
+              key,
+            );
     }
     seen.remove(value);
     return result;

@@ -23,7 +23,7 @@ final class RumUserAction extends StatefulWidget {
 
   final String name;
   final Widget child;
-  final RumClient? client;
+  final MoleSignalRumClient? client;
   final RumContext context;
   final HitTestBehavior behavior;
   final double maximumMovement;
@@ -64,14 +64,15 @@ final class _RumUserActionState extends State<RumUserAction> {
     final double movement = (event.position - _position!).distance;
     if (elapsed <= widget.maximumDuration &&
         movement <= widget.maximumMovement) {
-      (widget.client ?? getRum())?.addInteraction(
-        widget.name,
+      final RenderObject? box = context.findRenderObject();
+      (widget.client ?? getRum())?.recordTap(
+        name: widget.name,
+        position: event.position,
+        explicit: true,
+        targetSize: box is RenderBox && box.hasSize ? box.size : null,
         context: <String, Object?>{
           ...widget.context,
           'pointer_kind': _kind?.name,
-          'x': event.position.dx.round(),
-          'y': event.position.dy.round(),
-          'selector': 'flutter:${widget.name}',
         },
       );
     }

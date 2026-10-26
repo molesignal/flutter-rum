@@ -13,14 +13,17 @@ Future<void> main() async {
       env: 'development',
       version: String.fromEnvironment(
         'MOLESIGNAL_VERSION',
-        defaultValue: '0.3.0',
+        defaultValue: '0.2.0-alpha.1',
       ),
+      buildVersion: String.fromEnvironment('MOLESIGNAL_BUILD_VERSION'),
       architecture: String.fromEnvironment('MOLESIGNAL_ARCHITECTURE'),
       debugId: String.fromEnvironment('MOLESIGNAL_DEBUG_ID'),
       sessionReplaySampleRate: 100,
       trackUserInteractions: true,
     ),
   );
+  rum.setUser(const RumUser(id: 'example-user', name: 'Example User'));
+  rum.addFeatureFlagEvaluation('new_home', true);
   runApp(
     RumApp(
       client: rum,
@@ -63,6 +66,21 @@ final class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  Future<void> _sendRequest() async {
+    try {
+      await _httpClient.get(Uri.parse('https://example.com/health'));
+    } catch (error, stackTrace) {
+      widget.rum.addError(error, stackTrace: stackTrace);
+    }
+  }
+
+  Future<void> _measureLoad() async {
+    widget.rum.startDurationVital('example_load');
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    widget.rum.stopDurationVital('example_load');
+    widget.rum.addTiming('example_loaded');
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const Text('MoleSignal RUM example')),
@@ -79,14 +97,19 @@ final class _HomePageState extends State<HomePage> {
             ),
           ),
           TextButton(
-            onPressed: () async {
-              try {
-                await _httpClient.get(Uri.parse('https://example.com/health'));
-              } catch (error, stackTrace) {
-                widget.rum.addError(error, stackTrace: stackTrace);
-              }
-            },
+            onPressed: _sendRequest,
             child: const Text('Send an instrumented request'),
+          ),
+          TextButton(
+            onPressed: _measureLoad,
+            child: const Text('Measure a duration'),
+          ),
+          TextButton(
+            onPressed: () => widget.rum.addAction(
+              'Checkout submitted',
+              context: const <String, Object?>{'cart_size': 3},
+            ),
+            child: const Text('Record a custom action'),
           ),
         ],
       ),

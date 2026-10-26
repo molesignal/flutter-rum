@@ -1,9 +1,14 @@
 # Flutter release symbols and build identity
 
 MoleSignal matches an error frame to a debug artifact with the same
-`application_id`, `service`, `release`, `kind`, `platform`, `architecture`, and
-`debug_id`. The values passed to `RumConfiguration` must therefore come from
-the same CI build that produced the uploaded artifact.
+`application_id`, `service`, release (`version`), `kind`, `platform`,
+`architecture`, and `debug_id`. The values passed to `RumConfiguration` must
+therefore come from the same CI build that produced the uploaded artifact.
+
+The SDK sends them with every error event as `application.id`, `service`,
+`version`, `build_id` (the `debugId`), `os.name`, and `device.architecture`,
+and on each frame as `artifact_kind`, `debug_id` (the `debugId`, or the frame's
+own), and the addresses a symbol file resolves.
 
 ## Recommended CI values
 
@@ -21,10 +26,11 @@ const RumConfiguration(
 )
 ```
 
-`platform` is detected as `android`, `ios`, or `flutter` (Flutter Web).
-`architecture` is detected at runtime, but release pipelines should pass its
-canonical value explicitly: `arm64`, `armv7`, `x86_64`, `javascript`, or
-`wasm32`. Generate a new `debug_id` for every build whose code can differ, and
+`platform` is detected as `android`, `ios`, or `flutter` (Flutter Web) and
+decides how stack traces are parsed. `architecture` (sent as
+`device.architecture`) is detected at runtime, but release pipelines should
+pass its canonical value explicitly: `arm64`, `armv7`, `x86_64`, `javascript`,
+or `wasm32`. Generate a new `debug_id` for every build whose code can differ, and
 use exactly that value for every artifact belonging to that build. The
 architecture remains a separate matching key, so a multi-ABI build may use one
 build ID with one artifact per architecture.
@@ -48,6 +54,17 @@ flutter build apk \
   --dart-define=MOLESIGNAL_DEBUG_ID="$BUILD_ID" \
   --dart-define=MOLESIGNAL_RUM_TOKEN="$RUM_TOKEN"
 ```
+
+With `--split-debug-info` the Dart runtime prints stack traces without names:
+a header with the `build_id` and `isolate_dso_base` of the running image, then
+one `#00 abs <address> virt <address> …` line per frame. The SDK keeps what a
+symbol file needs from them: each frame has `artifact_kind: flutter_symbols`,
+`instruction_addr` (absolute), `image_addr` (the image base), and
+`relative_address` (`virt`), and the runtime's `build_id` next to the
+configured `debug_id`; the receiver finds the symbol file by `debug_id` and
+falls back to `build_id`. A build without `--split-debug-info` (a debug build,
+or a release build made without it) prints readable frames (`function`,
+`file`, `line`, `column`), which name no artifact.
 
 Upload the generated `app.android-arm64.symbols` as:
 
@@ -95,12 +112,16 @@ flutter build web \
 ```
 
 Upload `main.dart.js.map` as `kind=javascript_sourcemap`, `platform=flutter`,
-`architecture=javascript`. Web frame filenames are sent without credentials or
-query strings and use one-based line/column values. Native address fields are
-not sent for `platform=flutter`, so a future Wasm address cannot accidentally
-select a mobile `flutter_symbols` artifact. Wasm symbolication requires a
-JavaScript/source-map location until the receiver gains a dedicated Wasm
-artifact kind.
+`architecture=javascript`. Web frames have `file`, `function`, one-based `line`
+and `column`, and the `debug_id`, and **no `artifact_kind`**: the receiver takes
+a frame with a `file` and a `line` but no `artifact_kind` for a JavaScript frame
+(the contract's `javascript_sourcemap` value says the same) and finds the
+source map by `debug_id`, else by file name, as it does for browser errors.
+File names are sent without credentials or query strings. Native address
+fields are not sent for `platform=flutter`, so a future Wasm address cannot
+accidentally select a mobile `flutter_symbols` artifact. Wasm symbolication
+requires a JavaScript/source-map location until the receiver gains a dedicated
+Wasm artifact kind.
 
 ## Upload helper
 
@@ -119,5 +140,4 @@ tool/upload_debug_artifact.sh \
 Missing, stale, wrong-architecture, wrong-release, or wrong-debug-ID artifacts
 do not cause the SDK to discard the error. MoleSignal preserves the sanitized
 original frame, records a missing/partial symbolication state, and appends
-`original_function`, `original_file`, `original_line`, and `original_column`
-only when translation succeeds.
+`original_*` fields to the frame only when translation succeeds.

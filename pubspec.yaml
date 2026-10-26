@@ -1,6 +1,6 @@
 name: molesignal_flutter
 description: Official MoleSignal Real User Monitoring SDK for Flutter applications.
-version: 0.1.0-alpha.1
+version: 0.2.0-alpha.1
 homepage: https://github.com/molesignal/flutter-rum
 repository: https://github.com/molesignal/flutter-rum.git
 issue_tracker: https://github.com/molesignal/flutter-rum/issues
@@ -10,6 +10,9 @@ environment:
   flutter: ">=3.35.0"
 
 dependencies:
+  battery_plus: '>=6.0.0 <8.0.0'
+  connectivity_plus: '>=6.0.0 <8.0.0'
+  device_info_plus: '>=11.0.0 <14.0.0'
   flutter:
     sdk: flutter
   http: ^1.6.0
@@ -19,6 +22,7 @@ dev_dependencies:
   flutter_lints: ^6.0.0
   flutter_test:
     sdk: flutter
+  json_schema: ^5.2.0
 
 topics:
   - observability

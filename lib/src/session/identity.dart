@@ -43,7 +43,7 @@ Future<String?> getAnonymousUserId(
   try {
     final String? existing = await persistence.read(key);
     if (existing != null && existing.isNotEmpty) return existing;
-    final String created = generateId('anon');
+    final String created = generateUuid();
     await persistence.write(key, created);
     return created;
   } on Object catch (error, stackTrace) {
@@ -53,7 +53,7 @@ Future<String?> getAnonymousUserId(
       error,
       stackTrace,
     );
-    return generateId('anon');
+    return generateUuid();
   }
 }
 

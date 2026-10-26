@@ -4,9 +4,9 @@ typedef RumContext = Map<String, Object?>;
 /// Controls whether raw error stacks may be uploaded.
 enum RumPrivacyLevel { mask, allow }
 
-/// Debug artifact type used to symbolicate a structured stack frame.
+/// Debug artifact type used to symbolicate a structured stack frame
+/// (`error.frames[].artifact_kind`).
 enum RumArtifactKind {
-  javascriptSourcemap('javascript_sourcemap'),
   flutterSymbols('flutter_symbols'),
   androidNativeSymbols('android_native_symbols'),
   appleDsym('apple_dsym');
@@ -20,11 +20,14 @@ enum RumArtifactKind {
 ///
 /// Native integrations should provide addresses as hexadecimal strings with a
 /// `0x` prefix. Dart frames normally only need [function], [file], [line], and
-/// [column]; obfuscated AOT integrations can additionally provide addresses.
+/// [column]; obfuscated AOT frames carry addresses instead and name the
+/// [artifactKind] that resolves them. Flutter Web frames have no artifact kind:
+/// their source map is selected by [file] and [debugId].
 final class RumStackFrame {
   const RumStackFrame({
-    required this.artifactKind,
+    this.artifactKind,
     this.module,
+    this.className,
     this.function,
     this.file,
     this.line,
@@ -33,10 +36,12 @@ final class RumStackFrame {
     this.imageAddress,
     this.relativeAddress,
     this.debugId,
+    this.buildId,
   });
 
-  final RumArtifactKind artifactKind;
+  final RumArtifactKind? artifactKind;
   final String? module;
+  final String? className;
   final String? function;
   final String? file;
   final int? line;
@@ -44,11 +49,19 @@ final class RumStackFrame {
   final String? instructionAddress;
   final String? imageAddress;
   final String? relativeAddress;
+
+  /// Build identity shared with `/api/v1/debug-artifacts` uploads. Defaults to
+  /// `RumConfiguration.debugId`.
   final String? debugId;
 
+  /// Build identifier reported by the runtime itself, for example the `build_id`
+  /// in a Dart AOT stack trace header.
+  final String? buildId;
+
   RumContext toJson() => <String, Object?>{
-    'artifact_kind': artifactKind.wireName,
+    if (artifactKind != null) 'artifact_kind': artifactKind!.wireName,
     if (module != null) 'module': module,
+    if (className != null) 'class': className,
     if (function != null) 'function': function,
     if (file != null) 'file': file,
     if (line != null) 'line': line,
@@ -57,67 +70,39 @@ final class RumStackFrame {
     if (imageAddress != null) 'image_addr': imageAddress,
     if (relativeAddress != null) 'relative_address': relativeAddress,
     if (debugId != null) 'debug_id': debugId,
+    if (buildId != null) 'build_id': buildId,
   };
 }
 
-/// Stable mobile performance metric names consumed by MoleSignal RUM.
-enum RumPerformanceMetricKind {
-  coldStart('cold_start'),
-  warmStart('warm_start'),
-  viewLoad('view_load'),
-  slowFrame('slow_frame'),
-  frozenFrame('frozen_frame'),
-  jank('jank'),
-  anr('anr'),
-  memory('memory'),
-  network('network');
+/// The kind of a user action (`action.type`). The automatic
+/// `application_start` action is not user-selectable.
+enum RumActionType {
+  tap('tap'),
+  click('click'),
+  scroll('scroll'),
+  swipe('swipe'),
+  back('back'),
+  custom('custom');
 
-  const RumPerformanceMetricKind(this.wireName);
+  const RumActionType(this.wireName);
 
   final String wireName;
 }
 
-/// Unit used by a [RumPerformanceMetric].
-enum RumMetricUnit {
-  microsecond('microsecond'),
-  byte('byte'),
-  count('count');
+/// Where an error came from (`error.source`).
+enum RumErrorSource {
+  source('source'),
+  network('network'),
+  console('console'),
+  logger('logger'),
+  agent('agent'),
+  webview('webview'),
+  custom('custom'),
+  report('report');
 
-  const RumMetricUnit(this.wireName);
-
-  final String wireName;
-}
-
-/// Clock source used to produce a performance value.
-enum RumMetricClock {
-  monotonic('monotonic'),
-  epoch('epoch');
-
-  const RumMetricClock(this.wireName);
+  const RumErrorSource(this.wireName);
 
   final String wireName;
-}
-
-/// A manually supplied performance metric from a platform integration.
-final class RumPerformanceMetric {
-  const RumPerformanceMetric({
-    required this.kind,
-    required this.value,
-    required this.unit,
-    this.clock = RumMetricClock.monotonic,
-    this.timestampMicros,
-    this.context = const <String, Object?>{},
-  });
-
-  final RumPerformanceMetricKind kind;
-  final num value;
-  final RumMetricUnit unit;
-  final RumMetricClock clock;
-
-  /// Epoch microseconds. Durations must stay in [value] and use a monotonic
-  /// [clock] instead of deriving them from wall-clock timestamps.
-  final int? timestampMicros;
-  final RumContext context;
 }
 
 /// Outcome of a bounded transport flush or stop operation.
@@ -131,22 +116,48 @@ final class RumFlushResult {
     this.dropReasons = const <String, int>{},
   });
 
+  /// Events (or replay events) the receiver confirmed.
   final int accepted;
+
+  /// Events that failed with a retryable error and stay queued.
   final int retried;
+
+  /// Events discarded, including those the receiver rejected.
   final int dropped;
   final int remaining;
   final bool timedOut;
+
+  /// Drop counts by reason: `queue_full`, `expired`, `non_retryable`,
+  /// `rejected` (the receiver refused the event), and a few others.
   final Map<String, int> dropReasons;
 }
 
-/// The MoleSignal ingestion stream for an event.
+/// The event types of the MoleSignal event contract, plus session replay.
+///
+/// [wireName] is the contract's `type` value.
 enum RumEventKind {
-  session('session'),
+  view('view'),
   action('action'),
   error('error'),
+  resource('resource'),
+  longTask('long_task'),
+  vital('vital'),
   replay('replay');
 
   const RumEventKind(this.wireName);
+
+  final String wireName;
+}
+
+/// The receiver endpoint a [RumTransportRequest] is addressed to.
+enum RumUploadKind {
+  /// `POST /api/v1/rum/events`: a JSON array of contract events.
+  events('events'),
+
+  /// `POST /api/v1/rum/replay`: one replay segment.
+  replay('replay');
+
+  const RumUploadKind(this.wireName);
 
   final String wireName;
 }
@@ -173,6 +184,25 @@ final class RumUser {
   };
 }
 
+/// The account (organization, workspace, tenant) the user acts on behalf of.
+final class RumAccount {
+  const RumAccount({
+    required this.id,
+    this.name,
+    this.attributes = const <String, Object?>{},
+  });
+
+  final String id;
+  final String? name;
+  final RumContext attributes;
+
+  RumContext toJson() => <String, Object?>{
+    ...attributes,
+    'id': id,
+    if (name != null) 'name': name,
+  };
+}
+
 /// Context supplied to [RumBeforeSend].
 final class RumBeforeSendContext {
   const RumBeforeSendContext(this.kind);
@@ -182,7 +212,8 @@ final class RumBeforeSendContext {
 
 /// Runs immediately before an event is queued.
 ///
-/// The callback may mutate [event]. Returning `false` drops the event.
+/// The callback may mutate [event], which has the shape of the event contract
+/// (replay events are rrweb records). Returning `false` drops the event.
 typedef RumBeforeSend =
     bool? Function(RumContext event, RumBeforeSendContext context);
 
@@ -207,30 +238,43 @@ final class RumTransportRequest {
     required this.body,
     required this.headers,
     required this.kind,
+    this.compress = false,
   });
 
   final Uri url;
+
+  /// The uncompressed JSON body.
   final String body;
   final Map<String, String> headers;
-  final RumEventKind kind;
+  final RumUploadKind kind;
+
+  /// Whether the transport should send [body] with `Content-Encoding: gzip`
+  /// when it can.
+  final bool compress;
 }
 
 /// Response returned by a custom [RumTransport].
+///
+/// For `events` uploads [body] is the receiver's
+/// `{"accepted": n, "rejected": [{"index": i, "reason": "..."}]}` answer, and
+/// [headers] (lower-case names) may carry `retry-after`.
 final class RumTransportResponse {
   const RumTransportResponse({
     required this.ok,
     required this.status,
     this.statusText,
     this.body,
+    this.headers = const <String, String>{},
   });
 
   final bool ok;
   final int status;
   final String? statusText;
   final String? body;
+  final Map<String, String> headers;
 }
 
-/// Upload adapter used for application-owned ingestion proxies and tests.
+/// Upload adapter used for application-owned intake proxies and tests.
 abstract class RumTransport {
   Future<RumTransportResponse> send(RumTransportRequest request);
 
@@ -269,12 +313,15 @@ final class MemoryRumPersistence implements RumPersistence {
   }
 }
 
-/// W3C trace identifiers correlated with a network resource action.
+/// W3C trace identifiers correlated with a network resource.
+///
+/// [traceId] is the 32-hex trace; [spanId] the 16-hex span carried by the
+/// `traceparent` that was found. Both are lower-case.
 final class RumTraceContext {
-  const RumTraceContext({required this.traceId, required this.parentSpanId});
+  const RumTraceContext({required this.traceId, required this.spanId});
 
   final String traceId;
-  final String parentSpanId;
+  final String spanId;
 }
 
 /// Public context that can be forwarded to logs or traces created by the app.
@@ -282,49 +329,49 @@ final class RumInternalContext {
   const RumInternalContext({
     required this.applicationId,
     this.sessionId,
+    this.viewId,
     this.userId,
     this.service,
     this.environment,
     this.version,
-    this.platform,
-    this.architecture,
-    this.debugId,
+    this.buildId,
   });
 
   final String applicationId;
   final String? sessionId;
+  final String? viewId;
   final String? userId;
   final String? service;
   final String? environment;
   final String? version;
-  final String? platform;
-  final String? architecture;
-  final String? debugId;
+  final String? buildId;
 
   RumContext toJson() => <String, Object?>{
     'application_id': applicationId,
     if (sessionId != null) 'session_id': sessionId,
+    if (viewId != null) 'view_id': viewId,
     if (userId != null) 'user_id': userId,
     if (service != null) 'service': service,
     if (environment != null) 'env': environment,
     if (version != null) 'version': version,
-    if (platform != null) 'platform': platform,
-    if (architecture != null) 'architecture': architecture,
-    if (debugId != null) 'debug_id': debugId,
+    if (buildId != null) 'build_id': buildId,
   };
 }
 
-/// A manually or automatically measured network request.
+/// A network request that has already finished, reported with
+/// `MoleSignalRumClient.addResource`.
+///
+/// Use `startResource` / `stopResource` instead when the request should be
+/// attributed to the user action that triggered it.
 final class RumResource {
   const RumResource({
     required this.method,
     required this.url,
     required this.duration,
-    this.status,
+    this.startTime,
+    this.statusCode,
     this.responseSize,
-    this.requestSize,
     this.traceContext,
-    this.initiator = 'http',
     this.errorType,
     this.errorCode,
     this.errorMessage,
@@ -334,11 +381,18 @@ final class RumResource {
   final String method;
   final Uri url;
   final Duration duration;
-  final int? status;
+
+  /// Defaults to the moment the resource is reported minus [duration].
+  final DateTime? startTime;
+
+  /// `null` or `0` when the request failed before a response arrived.
+  final int? statusCode;
   final int? responseSize;
-  final int? requestSize;
   final RumTraceContext? traceContext;
-  final String initiator;
+
+  /// Set when no response arrived. [errorType] is a coarse class (`timeout`,
+  /// `dns`, `tls`, `cancel`, `connection`) and [errorCode] a stable detail.
+  /// A failed request produces a `network` error; a cancelled one does not.
   final String? errorType;
   final String? errorCode;
   final String? errorMessage;

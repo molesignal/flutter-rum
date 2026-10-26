@@ -1,6 +1,7 @@
 import 'package:flutter/widgets.dart';
 
-import '../client.dart';
+import '../models.dart';
+import '../rum_client.dart';
 
 /// Resolves a Flutter route into the view name sent to MoleSignal.
 typedef RumRouteNameResolver = String? Function(Route<dynamic> route);
@@ -10,7 +11,8 @@ String? defaultRumRouteNameResolver(Route<dynamic> route) {
   return name.isEmpty ? null : name;
 }
 
-/// Records visible named routes as RUM `view` actions.
+/// Records visible named routes as RUM views, and the back gesture of the
+/// iOS-style swipe as a `back` action.
 final class RumNavigationObserver extends NavigatorObserver {
   RumNavigationObserver(
     this.client, {
@@ -21,6 +23,7 @@ final class RumNavigationObserver extends NavigatorObserver {
   final RumRouteNameResolver nameResolver;
 
   Route<dynamic>? _currentRoute;
+  bool _userGestureActive = false;
 
   @override
   void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
@@ -31,6 +34,9 @@ final class RumNavigationObserver extends NavigatorObserver {
   @override
   void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
     super.didPop(route, previousRoute);
+    if (_userGestureActive) {
+      client.addAction('Back', type: RumActionType.back);
+    }
     _currentRoute = previousRoute;
     if (previousRoute != null) _show(previousRoute, navigationType: 'pop');
   }
@@ -49,13 +55,28 @@ final class RumNavigationObserver extends NavigatorObserver {
     }
   }
 
+  @override
+  void didStartUserGesture(
+    Route<dynamic> route,
+    Route<dynamic>? previousRoute,
+  ) {
+    super.didStartUserGesture(route, previousRoute);
+    _userGestureActive = true;
+  }
+
+  @override
+  void didStopUserGesture() {
+    super.didStopUserGesture();
+    _userGestureActive = false;
+  }
+
   void _show(Route<dynamic> route, {required String navigationType}) {
     _currentRoute = route;
     final String? name = nameResolver(route);
     if (name == null || name.trim().isEmpty) return;
     client.startView(
       name,
-      path: name,
+      name: name,
       context: <String, Object?>{
         'navigation_type': navigationType,
         if (route.settings.arguments != null) 'has_route_arguments': true,

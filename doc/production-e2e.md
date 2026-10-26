@@ -3,7 +3,9 @@
 The fixture in `example/integration_test/production_e2e_test.dart` runs against
 a real MoleSignal receiver. It emits a caught Dart release failure and can also
 forward one native frame obtained from an Android/iOS crash fixture. The test
-fails when ingestion is rejected, times out, or leaves persisted events.
+fails when the upload to intake is rejected, times out, or leaves persisted
+events; an event the receiver refuses (`rejected` in its answer) counts as
+dropped, so a contract mismatch fails the run.
 
 ## One-time example platform setup
 
@@ -57,10 +59,13 @@ export MOLESIGNAL_NATIVE_RELATIVE_ADDRESS=0x1234
 After the run, query the `rum_errors` stream with an administrative read token
 and assert all of the following:
 
-1. Both markers are scoped to `application=checkout-mobile`; querying another
-   application returns neither event.
-2. The Dart marker has restored function, file, and line fields and keeps the
-   sanitized obfuscated values under `original_*`.
+1. Both markers are scoped to `application=checkout-mobile` and carry
+   `source=flutter`, `error.source_type=flutter`, and the `build_id` you
+   exported as `MOLESIGNAL_DEBUG_ID`; querying another application returns
+   neither event.
+2. The Dart marker's frames (`error.frames`) carry `artifact_kind=flutter_symbols`
+   with addresses and have restored function, file, and line fields, keeping
+   the sanitized obfuscated values under `original_*`.
 3. The native marker selects the uploaded `android_native_symbols` or
    `apple_dsym` artifact for the exact architecture/debug ID.
 4. Re-running the same Replay segment (when Replay is enabled for an extended

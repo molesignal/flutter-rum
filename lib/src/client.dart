@@ -1,54 +1,52 @@
 import 'dart:async';
+import 'dart:math';
+import 'dart:ui' as ui;
 
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
 
 import 'configuration.dart';
+import 'environment/default_device_info.dart';
+import 'environment/device_info.dart';
+import 'events/action_scope.dart';
+import 'events/event_bodies.dart';
+import 'events/event_context.dart';
+import 'events/frame_json.dart';
+import 'events/frame_moments.dart';
+import 'events/pending.dart';
+import 'events/view_scope.dart';
 import 'instrumentation/flutter_instrumentation.dart';
 import 'instrumentation/sink.dart';
 import 'internal/diagnostics.dart';
-import 'internal/environment.dart';
 import 'internal/error_description.dart' as error_description;
 import 'internal/identifiers.dart';
+import 'internal/runtime_info.dart';
 import 'internal/sanitization.dart';
+import 'internal/transport_error.dart';
+import 'internal/units.dart';
 import 'internal/urls.dart';
 import 'models.dart';
 import 'persistence.dart';
 import 'replay/capture.dart';
+import 'rum_client.dart';
 import 'session/identity.dart';
 import 'session/session_manager.dart';
 import 'transport/event_transport.dart';
 
-/// Public operations supported by a MoleSignal RUM client.
-abstract interface class RumClient {
-  void setUser(RumUser user);
-  void clearUser();
-  RumUser? getUser();
+/// An action stays open this long after the last thing it caused.
+const Duration _actionQuietPeriod = Duration(milliseconds: 100);
 
-  void setGlobalContext(RumContext context);
-  void setGlobalContextProperty(String key, Object? value);
-  void removeGlobalContextProperty(String key);
-  RumContext getGlobalContext();
+/// An action never stays open longer than this, however slow its requests.
+const Duration _maximumActionDuration = Duration(seconds: 5);
 
-  void addAction(String name, {RumContext context});
-  void addInteraction(String name, {RumContext context});
-  void addError(
-    Object error, {
-    StackTrace? stackTrace,
-    List<RumStackFrame> frames,
-    RumContext context,
-  });
-  void addResource(RumResource resource);
-  void addPerformanceMetric(RumPerformanceMetric metric);
-  void startView(String name, {String? path, RumContext context});
+/// Taps this close together, this many times within a second, are a rage tap.
+const double _rageTapDistance = 50;
+const int _rageTapCount = 3;
 
-  void startSessionReplayRecording();
-  void stopSessionReplayRecording();
+/// Same-signature errors closer together than this are reported once.
+const int _errorDeduplicationMillis = 1000;
 
-  RumInternalContext getInternalContext();
-  Future<RumFlushResult> flush();
-  Future<RumFlushResult> stop();
-}
+const Duration _memorySampleInterval = Duration(seconds: 1);
 
 /// Flutter implementation of the MoleSignal RUM client.
 final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
@@ -56,22 +54,24 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
     required NormalizedRumConfiguration configuration,
     required SessionManager sessionManager,
     required EventTransport eventTransport,
-    required RumContext environment,
+    required RumDeviceInfoProvider deviceInfo,
     required String? anonymousUserId,
-    required Stopwatch startupStopwatch,
+    required int startedAtMicros,
   }) : _configuration = configuration,
        _sessionManager = sessionManager,
        _eventTransport = eventTransport,
-       _environment = environment,
-       _anonymousUserId = anonymousUserId,
-       _startupStopwatch = startupStopwatch,
-       _user = configuration.user,
-       _globalContext = Map<String, Object?>.from(configuration.globalContext);
+       _deviceInfo = deviceInfo,
+       _startedAtMicros = startedAtMicros,
+       _context = EventContext(
+         configuration: configuration,
+         deviceInfo: deviceInfo,
+         anonymousUserId: anonymousUserId,
+       );
 
   static Future<MoleSignalRumClient> create(
     RumConfiguration configuration,
   ) async {
-    final Stopwatch startupStopwatch = Stopwatch()..start();
+    final int startedAtMicros = nowMicros();
     WidgetsFlutterBinding.ensureInitialized();
     final NormalizedRumConfiguration normalized =
         NormalizedRumConfiguration.from(configuration);
@@ -81,6 +81,7 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
     final SessionManager sessionManager = await SessionManager.create(
       normalized,
       persistence,
+      startedAtMicros: startedAtMicros,
     );
     final String? anonymousUserId = await getAnonymousUserId(
       normalized,
@@ -91,43 +92,56 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
       persistence,
       sessionManager.nextReplaySequence,
     );
+    final RumDeviceInfoProvider deviceInfo =
+        normalized.deviceInfoProvider ??
+        createDefaultDeviceInfoProvider(usePlugins: normalized.trackDeviceInfo);
+    try {
+      await deviceInfo.refresh().timeout(const Duration(milliseconds: 500));
+    } on Object {
+      // Device context is best effort; events go out without it.
+    }
     final MoleSignalRumClient client = MoleSignalRumClient._(
       configuration: normalized,
       sessionManager: sessionManager,
       eventTransport: eventTransport,
-      environment: readFlutterEnvironment(),
+      deviceInfo: deviceInfo,
       anonymousUserId: anonymousUserId,
-      startupStopwatch: startupStopwatch,
+      startedAtMicros: startedAtMicros,
     );
     client._start();
-    client._reportRecoveredSessions();
     return client;
   }
 
   final NormalizedRumConfiguration _configuration;
   final SessionManager _sessionManager;
   final EventTransport _eventTransport;
-  final RumContext _environment;
-  final String? _anonymousUserId;
-  final Stopwatch _startupStopwatch;
+  final RumDeviceInfoProvider _deviceInfo;
+  final int _startedAtMicros;
+
+  /// The identity and device context events carry, and their envelope.
+  final EventContext _context;
 
   late final FlutterRumInstrumentation _instrumentation;
-  RumUser? _user;
-  RumContext _globalContext;
-  String _currentViewPath = '';
-  String? _lastViewKey;
-  int _lastViewAtMicros = 0;
-  _InteractionSample? _lastExplicitInteraction;
+  ViewScope? _view;
+
+  /// The view to show again when the app returns to the foreground.
+  ViewScope? _resumeView;
+  ActionScope? _action;
+  final Map<String, PendingResource> _resources = <String, PendingResource>{};
+  final Map<String, PendingVital> _vitals = <String, PendingVital>{};
+  final List<TapSample> _taps = <TapSample>[];
+  TapSample? _lastExplicitTap;
   final Map<String, int> _recentErrors = <String, int>{};
   RumReplayCapture? _replayCapture;
   bool? _replayOverride;
-  int _visualChangeId = 0;
-  Stopwatch? _pendingViewRender;
-  String? _pendingViewName;
+  bool _startupRecorded = false;
+  int _lastMemorySampleMicros = 0;
   bool _stopped = false;
   bool _stopCompleted = false;
   Future<RumFlushResult>? _stopFuture;
-  bool _startupRecorded = false;
+
+  @visibleForTesting
+  SessionManager get sessionManager => _sessionManager;
 
   bool get resourceTrackingEnabled =>
       !_stopped && _configuration.trackResources;
@@ -138,8 +152,6 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
   bool get frustrationTrackingEnabled =>
       !_stopped && _configuration.trackFrustrations;
 
-  int get visualChangeId => _visualChangeId;
-
   RumPrivacyLevel get privacyLevel => _configuration.defaultPrivacyLevel;
 
   RumSessionReplayConfiguration get replayConfiguration =>
@@ -148,14 +160,21 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
   RumDiagnosticHandler? get diagnosticHandler => _configuration.onError;
 
   String get replayPage {
-    final String path = _currentViewPath.isEmpty ? '/' : _currentViewPath;
-    return 'molesignal://flutter$path';
+    final String path = _view?.url ?? '';
+    return 'molesignal://flutter${path.startsWith('/') ? path : '/$path'}';
   }
 
   void _start() {
+    _context.inForeground = _lifecycleIsForeground(
+      SchedulerBinding.instance.lifecycleState,
+    );
+    _eventTransport.onFlushTick = _reportDirtyView;
     _eventTransport.start();
     _instrumentation = FlutterRumInstrumentation(_configuration, this)..start();
+    _scheduleStartup();
   }
+
+  // Identity and context ------------------------------------------------------
 
   @override
   void setUser(RumUser user) {
@@ -163,22 +182,24 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
     if (id.isEmpty) {
       throw ArgumentError.value(user.id, 'user.id', 'must be non-empty');
     }
-    _user = RumUser(
+    _context.user = RumUser(
       id: id,
       name: user.name,
       email: user.email,
       attributes: sanitizeContext(user.attributes),
     );
+    _view?.dirty = true;
   }
 
   @override
   void clearUser() {
-    _user = null;
+    _context.user = null;
+    _view?.dirty = true;
   }
 
   @override
   RumUser? getUser() {
-    final RumUser? user = _user;
+    final RumUser? user = _context.user;
     if (user == null) return null;
     return RumUser(
       id: user.id,
@@ -189,146 +210,463 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
   }
 
   @override
+  void setAccount(RumAccount account) {
+    final String id = account.id.trim();
+    if (id.isEmpty) {
+      throw ArgumentError.value(account.id, 'account.id', 'must be non-empty');
+    }
+    _context.account = RumAccount(
+      id: id,
+      name: account.name,
+      attributes: sanitizeContext(account.attributes),
+    );
+    _view?.dirty = true;
+  }
+
+  @override
+  void clearAccount() {
+    _context.account = null;
+    _view?.dirty = true;
+  }
+
+  @override
+  RumAccount? getAccount() {
+    final RumAccount? account = _context.account;
+    if (account == null) return null;
+    return RumAccount(
+      id: account.id,
+      name: account.name,
+      attributes: Map<String, Object?>.from(account.attributes),
+    );
+  }
+
+  @override
   void setGlobalContext(RumContext context) {
-    _globalContext = sanitizeContext(context);
+    _context.globalContext = sanitizeContext(context);
+    _view?.dirty = true;
   }
 
   @override
   void setGlobalContextProperty(String key, Object? value) {
     final String normalized = key.trim();
-    if (normalized.isNotEmpty) _globalContext[normalized] = value;
+    if (normalized.isEmpty) return;
+    _context.globalContext[normalized] = value;
+    _view?.dirty = true;
   }
 
   @override
   void removeGlobalContextProperty(String key) {
-    _globalContext.remove(key);
+    _context.globalContext.remove(key);
+    _view?.dirty = true;
   }
 
   @override
-  RumContext getGlobalContext() => sanitizeContext(_globalContext);
+  void clearGlobalContext() {
+    _context.globalContext = <String, Object?>{};
+    _view?.dirty = true;
+  }
+
+  @override
+  RumContext getGlobalContext() => sanitizeContext(_context.globalContext);
+
+  @override
+  void addFeatureFlagEvaluation(String name, Object? value) {
+    final String key = name.trim();
+    if (key.isEmpty || _stopped) return;
+    final Map<String, Object?> flags = _context.featureFlags;
+    if (!flags.containsKey(key) && flags.length >= 100) return;
+    flags[key] = value;
+    _view?.dirty = true;
+  }
+
+  // Views ---------------------------------------------------------------------
+
+  @override
+  void startView(
+    String key, {
+    String? name,
+    RumContext context = const <String, Object?>{},
+  }) {
+    final String viewKey = key.trim();
+    if (viewKey.isEmpty || _stopped) return;
+    final String viewName = name?.trim().isNotEmpty == true
+        ? name!.trim()
+        : viewKey;
+    final RumSession? session = _prepareSession();
+    if (session == null || !session.sampled) return;
+    final ViewScope? current = _view;
+    if (current != null &&
+        current.active &&
+        current.session.id == session.id &&
+        current.key == viewKey &&
+        current.name == viewName &&
+        current.timeSpent <= _configuration.actionDeduplicationWindow) {
+      return;
+    }
+    _resumeView = null;
+    _completeAction();
+    if (current != null) _endView(current);
+    _beginView(
+      key: viewKey,
+      name: viewName,
+      session: session,
+      context: context,
+    );
+  }
+
+  @override
+  void stopView(String key) {
+    final ViewScope? view = _view;
+    if (_stopped || view == null || !view.active || view.key != key.trim()) {
+      return;
+    }
+    _resumeView = null;
+    _completeAction();
+    _endView(view);
+  }
+
+  @override
+  void addTiming(String name) {
+    if (_stopped) return;
+    final ViewScope? view = _view;
+    if (view == null || !view.active) return;
+    view.addTiming(name);
+  }
+
+  ViewScope _beginView({
+    required String key,
+    required String name,
+    required RumSession session,
+    String loadingType = 'view_controller_display',
+    RumContext context = const <String, Object?>{},
+  }) {
+    // A view that ended and then received late events (an error while the app
+    // was in the background) has changes the receiver has not seen.
+    final ViewScope? previous = _view;
+    if (previous != null && previous.dirty) _reportView(previous);
+    final String url = sanitizeUrl(key, _configuration.trackUrlQueryString);
+    final ViewScope view = ViewScope(
+      key: key,
+      name: name,
+      url: url.isEmpty ? '/' : url,
+      session: session,
+      loadingType: loadingType,
+      context: sanitizeContext(context),
+    );
+    _view = view;
+    _sampleMemory(view, force: true);
+    _reportView(view);
+    _scheduleFirstBuild(view);
+    _requestReplayCapture(session);
+    return view;
+  }
+
+  void _endView(ViewScope view) {
+    if (!view.active) return;
+    _sampleMemory(view, force: true);
+    view.stop();
+    _reportView(view);
+  }
+
+  /// The view events of [session] belong to, started when there is none.
+  /// A view never spans sessions: when the session was renewed under it, the
+  /// old view ends and the same screen continues in a new one.
+  ViewScope _currentView(RumSession session) {
+    final ViewScope? existing = _view;
+    if (existing == null) {
+      return _beginView(
+        key: 'ApplicationLaunch',
+        name: 'ApplicationLaunch',
+        session: session,
+      );
+    }
+    if (existing.session.id == session.id) return existing;
+    _completeAction();
+    final bool wasActive = existing.active;
+    _endView(existing);
+    return _beginView(
+      key: existing.key,
+      name: existing.name,
+      session: session,
+      loadingType: wasActive ? 'session_renewal' : 'view_controller_display',
+      context: existing.context,
+    );
+  }
+
+  void _reportView(ViewScope view) {
+    final RumSession session = view.session;
+    if (!session.sampled) return;
+    final RumContext body = view.report();
+    _emit(
+      RumEventKind.view,
+      _context.wrap(
+        RumEventKind.view,
+        date: view.startedAtMillis,
+        view: view,
+        body: body,
+        context: view.context,
+      ),
+    );
+  }
+
+  void _reportDirtyView() {
+    if (_stopped) return;
+    final ViewScope? view = _view;
+    if (view == null || !view.dirty) return;
+    if (view.active) _sampleMemory(view, force: true);
+    _reportView(view);
+  }
+
+  void _sampleMemory(ViewScope view, {bool force = false}) {
+    if (!_configuration.trackViewPerformance) return;
+    final int now = nowMicros();
+    if (!force &&
+        now - _lastMemorySampleMicros < _memorySampleInterval.inMicroseconds) {
+      return;
+    }
+    _lastMemorySampleMicros = now;
+    final int? bytes = currentMemoryBytes();
+    if (bytes != null) view.sampleMemory(bytes);
+  }
+
+  // Actions -------------------------------------------------------------------
 
   @override
   void addAction(
     String name, {
+    RumActionType type = RumActionType.custom,
     RumContext context = const <String, Object?>{},
   }) {
     final String normalized = name.trim();
     if (normalized.isEmpty || _stopped) return;
-    _recordAction(
-      _ActionInput(type: 'custom', name: normalized, context: context),
+    _startAction(
+      ActionScope(
+        type: type.wireName,
+        name: normalized,
+        nameSource: 'custom_attribute',
+        context: context,
+      ),
     );
   }
 
-  @override
-  void addInteraction(
-    String name, {
-    RumContext context = const <String, Object?>{},
-  }) {
-    final String normalized = name.trim();
-    if (normalized.isEmpty || _stopped) return;
-    _lastExplicitInteraction = _InteractionSample.fromContext(
-      nowMicros(),
-      context,
-    );
-    _recordAction(
-      _ActionInput(type: 'tap', name: normalized, context: context),
-    );
-  }
-
-  void recordAutomaticInteraction(
-    String name, {
+  /// A tap on the screen. [explicit] taps come from `RumUserAction` and carry
+  /// the developer's name; automatic ones from `RumApp` and are named
+  /// generically so no screen content is read. Only automatic taps depend on
+  /// `trackUserInteractions`.
+  void recordTap({
+    required String name,
     required Offset position,
+    required bool explicit,
+    Size? targetSize,
     RumContext context = const <String, Object?>{},
   }) {
-    if (!userInteractionTrackingEnabled) return;
-    final int timestamp = nowMicros();
-    final _InteractionSample? explicit = _lastExplicitInteraction;
-    if (explicit != null &&
-        timestamp - explicit.timestampMicros <=
-            _configuration.actionDeduplicationWindow.inMicroseconds &&
-        explicit.isNear(position)) {
-      return;
+    if (_stopped || (!explicit && !userInteractionTrackingEnabled)) return;
+    final int now = nowMillis();
+    final TapSample sample = TapSample(now, position);
+    if (explicit) {
+      _lastExplicitTap = sample;
+    } else {
+      final TapSample? previous = _lastExplicitTap;
+      if (previous != null &&
+          now - previous.millis <=
+              _configuration.actionDeduplicationWindow.inMilliseconds &&
+          (previous.position - position).distance <= 18) {
+        return;
+      }
     }
-    _recordAction(
-      _ActionInput(
+    final List<String> frustrations = <String>[
+      if (_configuration.trackFrustrations && _isRageTap(sample)) 'rage_tap',
+    ];
+    _startAction(
+      ActionScope(
         type: 'tap',
         name: name,
-        timestampMicros: timestamp,
-        context: <String, Object?>{
-          ...context,
-          'x': position.dx.round(),
-          'y': position.dy.round(),
-          'selector': 'flutter:interactive',
-        },
+        nameSource: explicit ? 'custom_attribute' : 'mask_placeholder',
+        selector: explicit ? 'flutter:$name' : 'flutter:interactive',
+        position: (x: position.dx.round(), y: position.dy.round()),
+        targetWidth: targetSize?.width.round(),
+        targetHeight: targetSize?.height.round(),
+        frustrations: frustrations,
+        context: context,
       ),
+      position: position,
     );
   }
 
-  void recordFrustration(
-    String type,
-    String name, {
+  /// A system back gesture or button press.
+  @override
+  void recordBack() {
+    if (!userInteractionTrackingEnabled) return;
+    _startAction(ActionScope(type: 'back', name: 'Back'));
+  }
+
+  bool _isRageTap(TapSample tap) {
+    _taps.removeWhere((TapSample item) => item.millis < tap.millis - 1000);
+    _taps.add(tap);
+    final int nearby = _taps
+        .where(
+          (TapSample item) =>
+              (item.position - tap.position).distance <= _rageTapDistance,
+        )
+        .length;
+    if (nearby < _rageTapCount) return false;
+    _taps.clear();
+    return true;
+  }
+
+  void _startAction(ActionScope scope, {Offset? position}) {
+    try {
+      final RumSession? session = _prepareSession();
+      if (session == null || !session.sampled) return;
+      final ViewScope view = _currentView(session);
+      _completeAction();
+      _action = scope;
+      _scheduleActionCheck(scope);
+      _recordReplayPointer(session, position);
+      _requestReplayCapture(session);
+      view.dirty = true;
+    } on Object catch (error, stackTrace) {
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM action recording failed',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
+  void _scheduleActionCheck(ActionScope scope) {
+    scope.timer?.cancel();
+    scope.timer = Timer(_actionQuietPeriod, () {
+      if (!identical(_action, scope)) return;
+      final bool waiting =
+          scope.elapsed < _maximumActionDuration &&
+          (scope.pendingResources > 0 || scope.quietFor < _actionQuietPeriod);
+      if (waiting) {
+        _scheduleActionCheck(scope);
+      } else {
+        _completeAction();
+      }
+    });
+  }
+
+  /// Emits the open action, if any, with what it caused so far.
+  void _completeAction() {
+    final ActionScope? scope = _action;
+    if (scope == null) return;
+    _action = null;
+    scope.timer?.cancel();
+    scope.timer = null;
+    final ViewScope? view = _view;
+    if (view == null || !view.session.sampled) return;
+    try {
+      if (scope.isTap &&
+          scope.errorCount > 0 &&
+          _configuration.trackFrustrations) {
+        scope.addFrustration('error_tap');
+      }
+      view.actionCount += 1;
+      view.frustrationCount += scope.frustrations.length;
+      view.dirty = true;
+      _emit(
+        RumEventKind.action,
+        _context.wrap(
+          RumEventKind.action,
+          date: scope.startedAtMillis,
+          view: view,
+          body: actionBody(scope),
+          context: scope.context,
+        ),
+      );
+    } on Object catch (error, stackTrace) {
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM action recording failed',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
+  // Resources -----------------------------------------------------------------
+
+  @override
+  void startResource(
+    String key,
+    String method,
+    Uri url, {
     RumContext context = const <String, Object?>{},
   }) {
-    if (!frustrationTrackingEnabled || _stopped) return;
-    _recordAction(_ActionInput(type: type, name: name, context: context));
+    if (!_trackable(url)) return;
+    // A request that never ends (a response body nobody reads) must neither
+    // pile up nor hold its action open for good.
+    final PendingResource? replaced = _resources.remove(key);
+    _forget(replaced ?? (_resources.length >= 256 ? _oldestResource() : null));
+    final ActionScope? action = _action;
+    action?.pendingResources += 1;
+    action?.touch();
+    _resources[key] = PendingResource(
+      method: method,
+      url: url,
+      action: action,
+      context: context,
+    );
+  }
+
+  PendingResource? _oldestResource() {
+    if (_resources.isEmpty) return null;
+    return _resources.remove(_resources.keys.first);
+  }
+
+  void _forget(PendingResource? pending) {
+    final ActionScope? action = pending?.action;
+    if (action != null && pending!.counted) {
+      action.pendingResources = max(0, action.pendingResources - 1);
+    }
   }
 
   @override
-  void startView(
-    String name, {
-    String? path,
+  void stopResource(
+    String key, {
+    int? statusCode,
+    int? size,
+    RumTraceContext? traceContext,
     RumContext context = const <String, Object?>{},
   }) {
-    final String logicalName = name.trim();
-    if (logicalName.isEmpty || _stopped) return;
-    final String candidatePath = path?.trim().isNotEmpty == true
-        ? path!.trim()
-        : logicalName;
-    final String url = sanitizeUrl(
-      candidatePath,
-      _configuration.trackUrlQueryString,
+    final PendingResource? pending = _resources.remove(key);
+    if (pending == null) return;
+    _finishResource(
+      pending,
+      statusCode: statusCode,
+      size: size,
+      traceContext: traceContext,
+      context: context,
     );
-    final String nextPath = pagePath(url);
-    final int timestamp = nowMicros();
-    final String viewKey = '$logicalName|$nextPath';
-    if (_lastViewKey == viewKey &&
-        timestamp - _lastViewAtMicros <=
-            _configuration.actionDeduplicationWindow.inMicroseconds) {
-      return;
-    }
-    _lastViewKey = viewKey;
-    _lastViewAtMicros = timestamp;
-    _currentViewPath = nextPath;
-    _visualChangeId += 1;
-    if (_configuration.trackViewPerformance) {
-      _pendingViewName = logicalName;
-      _pendingViewRender = Stopwatch()..start();
-    }
-    _recordAction(
-      _ActionInput(
-        type: 'view',
-        name: 'View $logicalName',
-        url: url,
-        timestampMicros: timestamp,
-        context: <String, Object?>{
-          ...context,
-          'path': _currentViewPath,
-          'view_name': logicalName,
-        },
-      ),
+  }
+
+  @override
+  void stopResourceWithError(
+    String key,
+    Object error, {
+    int? statusCode,
+    RumTraceContext? traceContext,
+    RumContext context = const <String, Object?>{},
+  }) {
+    final PendingResource? pending = _resources.remove(key);
+    if (pending == null) return;
+    _finishResource(
+      pending,
+      statusCode: statusCode,
+      failure: error,
+      traceContext: traceContext,
+      context: context,
     );
   }
 
   @override
   void addResource(RumResource resource) {
-    if (!resourceTrackingEnabled ||
-        isSdkUrl(resource.url) ||
-        !shouldTrackUrl(resource.url)) {
-      return;
-    }
+    if (!_trackable(resource.url)) return;
     if (resource.duration.isNegative ||
-        !_validMetricValue(resource.duration.inMicroseconds) ||
-        (resource.requestSize != null && resource.requestSize! < 0) ||
         (resource.responseSize != null && resource.responseSize! < 0)) {
       reportDiagnostic(
         _configuration.onError,
@@ -336,46 +674,135 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
       );
       return;
     }
-    _visualChangeId += 1;
-    final String method = resource.method.trim().toUpperCase();
-    final String url = sanitizeUrl(
-      resource.url.toString(),
-      _configuration.trackUrlQueryString,
-    );
-    _recordAction(
-      _ActionInput(
-        type: 'resource',
-        name: '$method ${resource.url.path.isEmpty ? '/' : resource.url.path}',
-        url: url,
-        durationMs: resource.duration.inMicroseconds / 1000,
-        durationUs: resource.duration.inMicroseconds,
-        status: resource.status,
-        traceContext: resource.traceContext,
-        context: <String, Object?>{
-          ...resource.context,
-          'method': method,
-          'initiator': resource.initiator,
-          'metric': RumPerformanceMetricKind.network.wireName,
-          'metric_value': resource.duration.inMicroseconds,
-          'metric_unit': RumMetricUnit.microsecond.wireName,
-          'clock': RumMetricClock.monotonic.wireName,
-          if (resource.requestSize != null)
-            'request_size': resource.requestSize,
-          if (resource.responseSize != null)
-            'response_size': resource.responseSize,
-          if (resource.errorType != null) 'error_type': resource.errorType,
-          if (resource.errorCode != null) 'error_code': resource.errorCode,
-          if (resource.errorMessage != null)
-            'error_message': sanitizeText(resource.errorMessage!),
-        },
+    final DateTime start =
+        resource.startTime ?? DateTime.now().subtract(resource.duration);
+    final ActionScope? action = _action;
+    _finishResource(
+      PendingResource(
+        method: resource.method,
+        url: resource.url,
+        action:
+            action != null &&
+                start.millisecondsSinceEpoch >= action.startedAtMillis
+            ? action
+            : null,
+        context: resource.context,
+        startedAtMillis: start.millisecondsSinceEpoch,
+        duration: resource.duration,
+        counted: false,
       ),
+      statusCode: resource.statusCode,
+      size: resource.responseSize,
+      traceContext: resource.traceContext,
+      failureType: resource.errorType,
+      failureCode: resource.errorCode,
+      failureMessage: resource.errorMessage,
     );
   }
+
+  bool _trackable(Uri url) =>
+      resourceTrackingEnabled && !isSdkUrl(url) && shouldTrackUrl(url);
+
+  void _finishResource(
+    PendingResource pending, {
+    int? statusCode,
+    int? size,
+    RumTraceContext? traceContext,
+    Object? failure,
+    String? failureType,
+    String? failureCode,
+    String? failureMessage,
+    RumContext context = const <String, Object?>{},
+  }) {
+    final ActionScope? action = pending.action;
+    if (action != null && pending.counted) {
+      action.pendingResources = max(0, action.pendingResources - 1);
+    }
+    try {
+      final RumSession? session = _prepareSession();
+      if (session == null || !session.sampled) return;
+      final ViewScope view = _currentView(session);
+      final bool attributed = action != null && identical(_action, action);
+      if (attributed) {
+        action.resourceCount += 1;
+        action.touch();
+      }
+      final NormalizedTransportError? failed = failure != null
+          ? normalizeTransportError(failure)
+          : (failureType == null &&
+                    failureCode == null &&
+                    failureMessage == null
+                ? null
+                : NormalizedTransportError(
+                    failureType ?? 'connection',
+                    failureCode ?? failureType ?? 'connection_failed',
+                    failureMessage ?? '',
+                  ));
+      final String url = sanitizeUrl(
+        pending.url.toString(),
+        _configuration.trackUrlQueryString,
+      );
+      final String method = pending.method.trim().toUpperCase();
+      final int? status = failed == null ? statusCode : (statusCode ?? 0);
+      view.resourceCount += 1;
+      view.dirty = true;
+      _emit(
+        RumEventKind.resource,
+        _context.wrap(
+          RumEventKind.resource,
+          date: pending.startedAtMillis,
+          view: view,
+          actionId: action?.id,
+          body: resourceBody(
+            method: method,
+            url: url,
+            duration: pending.duration ?? pending.elapsed,
+            statusCode: status,
+            size: size,
+            traceContext: traceContext,
+          ),
+          context: <String, Object?>{...pending.context, ...context},
+        ),
+      );
+      if (failed != null && failed.type != 'cancel') {
+        _recordError(
+          NetworkFailure(
+            failed.message.isEmpty
+                ? '$method $url failed'
+                : '$method $url failed: ${failed.message}',
+          ),
+          source: RumErrorSource.network,
+          handling: 'handled',
+          type: failed.code,
+          category: 'Network',
+          resource: <String, Object?>{
+            if (httpMethodOrNull(method) != null) 'method': method,
+            'status_code': 0,
+            'url': url,
+          },
+          includeStack: false,
+          dedupe: false,
+        );
+      }
+    } on Object catch (error, stackTrace) {
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM resource recording failed',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
+  // Errors --------------------------------------------------------------------
 
   @override
   void addError(
     Object error, {
     StackTrace? stackTrace,
+    RumErrorSource source = RumErrorSource.custom,
+    String? type,
+    String? fingerprint,
     List<RumStackFrame> frames = const <RumStackFrame>[],
     RumContext context = const <String, Object?>{},
   }) {
@@ -384,41 +811,10 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
       stackTrace: stackTrace,
       frames: frames,
       context: context,
-      source: 'manual',
-    );
-  }
-
-  @override
-  void addPerformanceMetric(RumPerformanceMetric metric) {
-    if (_stopped) return;
-    final double numericValue = metric.value.toDouble();
-    final int timestamp = metric.timestampMicros ?? nowMicros();
-    if (!_validMetricValue(numericValue) ||
-        numericValue < 0 ||
-        !_validEpochMicros(timestamp)) {
-      throw ArgumentError(
-        'RUM performance values must be finite, non-negative, and use a valid epoch-microsecond timestamp',
-      );
-    }
-    _recordAction(
-      _ActionInput(
-        type: 'performance',
-        name: metric.kind.wireName,
-        timestampMicros: timestamp,
-        durationUs: metric.unit == RumMetricUnit.microsecond
-            ? numericValue.round()
-            : null,
-        durationMs: metric.unit == RumMetricUnit.microsecond
-            ? numericValue / 1000
-            : null,
-        context: <String, Object?>{
-          ...metric.context,
-          'metric': metric.kind.wireName,
-          'metric_value': metric.value,
-          'metric_unit': metric.unit.wireName,
-          'clock': metric.clock.wireName,
-        },
-      ),
+      source: source,
+      handling: 'handled',
+      type: type,
+      fingerprint: fingerprint,
     );
   }
 
@@ -426,120 +822,457 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
   void recordCapturedError(
     Object error, {
     StackTrace? stackTrace,
-    RumContext context = const <String, Object?>{},
-    required String source,
+    RumContext meta = const <String, Object?>{},
+    required bool fatal,
   }) {
     _recordError(
       error,
       stackTrace: stackTrace,
-      frames: const <RumStackFrame>[],
-      context: context,
-      source: source,
+      source: RumErrorSource.source,
+      handling: 'unhandled',
+      isCrash: fatal,
+      meta: meta,
+    );
+  }
+
+  void _recordError(
+    Object error, {
+    StackTrace? stackTrace,
+    List<RumStackFrame> frames = const <RumStackFrame>[],
+    RumContext context = const <String, Object?>{},
+    required RumErrorSource source,
+    required String handling,
+    String? type,
+    String? fingerprint,
+    bool isCrash = false,
+    String category = 'Exception',
+    RumContext? resource,
+    RumContext meta = const <String, Object?>{},
+    bool includeStack = true,
+    bool dedupe = true,
+  }) {
+    if (_stopped) return;
+    try {
+      final RumSession? session = _prepareSession();
+      if (session == null || !session.sampled) return;
+      final error_description.ErrorDescription details = error_description
+          .describeError(
+            error,
+            includeStack ? stackTrace : StackTrace.empty,
+            platform: _configuration.platform,
+            debugId: _configuration.debugId,
+          );
+      final List<RumStackFrame> allFrames = <RumStackFrame>[
+        ...frames,
+        ...details.frames,
+      ].take(100).toList(growable: false);
+      final List<RumContext> serializedFrames = allFrames
+          .map(
+            (RumStackFrame frame) => frameJson(
+              frame,
+              native: _configuration.platform != 'flutter',
+              debugId: _configuration.debugId,
+            ),
+          )
+          .toList(growable: false);
+      if (dedupe && _isRecentDuplicate(details, serializedFrames)) return;
+
+      final ViewScope view = _currentView(session);
+      final ActionScope? action = _action;
+      if (action != null) {
+        action.errorCount += 1;
+        if (isCrash) action.crashCount += 1;
+        action.touch();
+      }
+      view.errorCount += 1;
+      if (isCrash) view.crashCount += 1;
+      view.dirty = true;
+      final bool rawStackAllowed =
+          _configuration.defaultPrivacyLevel == RumPrivacyLevel.allow;
+      _emit(
+        RumEventKind.error,
+        _context.wrap(
+          RumEventKind.error,
+          date: nowMillis(),
+          view: view,
+          actionId: action?.id,
+          body: errorBody(
+            message: details.message,
+            source: source,
+            handling: handling,
+            type: type ?? details.type,
+            stack: includeStack
+                ? (rawStackAllowed
+                      ? details.stackText
+                      : error_description.renderFrames(allFrames))
+                : null,
+            frames: serializedFrames,
+            fingerprint: fingerprint,
+            isCrash: isCrash,
+            category: category,
+            resource: resource,
+            wasTruncated: details.wasTruncated,
+            meta: meta,
+          ),
+          context: context,
+        ),
+      );
+      _requestReplayCapture(session);
+      if (isCrash) {
+        // The process may not survive: send the crash and the view's new
+        // crash count now.
+        _reportDirtyView();
+        unawaited(_eventTransport.flush());
+      }
+    } on Object catch (recordingError, recordingStack) {
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM error recording failed',
+        recordingError,
+        recordingStack,
+      );
+    }
+  }
+
+  bool _isRecentDuplicate(
+    error_description.ErrorDescription details,
+    List<RumContext> frames,
+  ) {
+    final String signature = <String>[
+      details.type,
+      details.message,
+      ...frames.take(3).map((RumContext frame) => frame.toString()),
+    ].join('|');
+    final int now = nowMillis();
+    final int? previous = _recentErrors[signature];
+    if (previous != null && now - previous < _errorDeduplicationMillis) {
+      return true;
+    }
+    _recentErrors[signature] = now;
+    if (_recentErrors.length >= 100) {
+      _recentErrors.removeWhere((String _, int time) => now - time > 60000);
+    }
+    return false;
+  }
+
+  // Vitals --------------------------------------------------------------------
+
+  @override
+  void startDurationVital(
+    String name, {
+    String? description,
+    RumContext context = const <String, Object?>{},
+  }) {
+    final String key = name.trim();
+    if (key.isEmpty || _stopped) return;
+    _vitals[key] = PendingVital(description: description, context: context);
+  }
+
+  @override
+  void stopDurationVital(
+    String name, {
+    String? description,
+    RumContext context = const <String, Object?>{},
+  }) {
+    final String key = name.trim();
+    final PendingVital? pending = _vitals.remove(key);
+    if (pending == null || _stopped) return;
+    _recordVital(
+      key,
+      pending.elapsed,
+      startedAtMillis: pending.startedAtMillis,
+      description: description ?? pending.description,
+      context: <String, Object?>{...pending.context, ...context},
     );
   }
 
   @override
-  void recordFrameTiming(FrameTiming timing) {
-    if (_stopped) return;
-    if (!_startupRecorded) {
-      _startupRecorded = true;
-      _startupStopwatch.stop();
-      final int startupMicros = _startupStopwatch.elapsedMicroseconds;
-      if (_validMetricValue(startupMicros)) {
-        addPerformanceMetric(
-          RumPerformanceMetric(
-            kind: RumPerformanceMetricKind.coldStart,
-            value: startupMicros,
-            unit: RumMetricUnit.microsecond,
-            context: const <String, Object?>{
-              'source': 'sdk_init_to_first_frame',
-            },
+  void addDurationVital(
+    String name,
+    Duration duration, {
+    String? description,
+    RumContext context = const <String, Object?>{},
+  }) {
+    final String key = name.trim();
+    if (key.isEmpty || duration.isNegative || _stopped) return;
+    _recordVital(
+      key,
+      duration,
+      startedAtMillis: nowMillis() - duration.inMilliseconds,
+      description: description,
+      context: context,
+    );
+  }
+
+  void _recordVital(
+    String name,
+    Duration duration, {
+    required int startedAtMillis,
+    String? description,
+    required RumContext context,
+  }) {
+    try {
+      final RumSession? session = _prepareSession();
+      if (session == null || !session.sampled) return;
+      final ViewScope view = _currentView(session);
+      _emit(
+        RumEventKind.vital,
+        _context.wrap(
+          RumEventKind.vital,
+          date: startedAtMillis,
+          view: view,
+          body: durationVitalBody(
+            name: name,
+            duration: duration,
+            description: description,
           ),
-        );
-      }
-    }
-    final Stopwatch? render = _pendingViewRender;
-    if (render != null && _configuration.trackViewPerformance) {
-      render.stop();
-      _pendingViewRender = null;
-      final String viewName = _pendingViewName ?? _currentViewPath;
-      _pendingViewName = null;
-      _recordAction(
-        _ActionInput(
-          type: 'view_performance',
-          name: 'Render $viewName',
-          durationMs: render.elapsedMicroseconds / 1000,
-          durationUs: render.elapsedMicroseconds,
-          context: <String, Object?>{
-            'metric': RumPerformanceMetricKind.viewLoad.wireName,
-            'metric_value': render.elapsedMicroseconds,
-            'metric_unit': RumMetricUnit.microsecond.wireName,
-            'clock': RumMetricClock.monotonic.wireName,
-            'build_duration_ms': timing.buildDuration.inMicroseconds / 1000,
-            'build_duration_us': timing.buildDuration.inMicroseconds,
-            'raster_duration_ms': timing.rasterDuration.inMicroseconds / 1000,
-            'raster_duration_us': timing.rasterDuration.inMicroseconds,
-            'vsync_overhead_ms': timing.vsyncOverhead.inMicroseconds / 1000,
-            'vsync_overhead_us': timing.vsyncOverhead.inMicroseconds,
-          },
+          context: context,
         ),
       );
+    } on Object catch (error, stackTrace) {
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM vital recording failed',
+        error,
+        stackTrace,
+      );
     }
-    if (_configuration.trackLongFrames &&
-        timing.totalSpan >= _configuration.longFrameThreshold) {
-      final bool frozen =
-          timing.totalSpan >= _configuration.frozenFrameThreshold;
-      final RumPerformanceMetricKind metric = frozen
-          ? RumPerformanceMetricKind.frozenFrame
-          : RumPerformanceMetricKind.slowFrame;
-      _recordAction(
-        _ActionInput(
-          type: frozen ? 'frozen_frame' : 'long_task',
-          name: frozen ? 'Frozen Flutter frame' : 'Slow Flutter frame',
-          durationMs: timing.totalSpan.inMicroseconds / 1000,
-          durationUs: timing.totalSpan.inMicroseconds,
-          context: <String, Object?>{
-            'metric': metric.wireName,
-            'metric_value': timing.totalSpan.inMicroseconds,
-            'metric_unit': RumMetricUnit.microsecond.wireName,
-            'clock': RumMetricClock.monotonic.wireName,
-            'jank': timing.totalSpan >= const Duration(microseconds: 33334),
-            'build_duration_ms': timing.buildDuration.inMicroseconds / 1000,
-            'build_duration_us': timing.buildDuration.inMicroseconds,
-            'raster_duration_ms': timing.rasterDuration.inMicroseconds / 1000,
-            'raster_duration_us': timing.rasterDuration.inMicroseconds,
-            'vsync_overhead_ms': timing.vsyncOverhead.inMicroseconds / 1000,
-            'vsync_overhead_us': timing.vsyncOverhead.inMicroseconds,
-          },
+  }
+
+  // Frames and startup --------------------------------------------------------
+
+  @override
+  void recordFrameTimings(List<FrameTiming> timings) {
+    if (_stopped || timings.isEmpty) return;
+    final int deliveredAt = nowMicros();
+    final int latestRasterFinish = timings
+        .map(
+          (FrameTiming t) =>
+              t.timestampInMicroseconds(ui.FramePhase.rasterFinish),
+        )
+        .reduce(max);
+    for (final FrameTiming timing in timings) {
+      _recordFrame(
+        timing,
+        frameStartMicros(
+          timing,
+          deliveredAtMicros: deliveredAt,
+          latestRasterFinish: latestRasterFinish,
         ),
       );
     }
   }
 
+  /// One frame, for callers that do not have a batch.
+  void recordFrameTiming(FrameTiming timing) =>
+      recordFrameTimings(<FrameTiming>[timing]);
+
+  void _recordFrame(FrameTiming timing, int startMicros) {
+    if (_stopped) return;
+    try {
+      final RumSession? session = _sessionManager.live();
+      final ViewScope? view = _view;
+      if (session == null ||
+          !session.sampled ||
+          view == null ||
+          view.session.id != session.id) {
+        return;
+      }
+      if (view.active && _configuration.trackViewPerformance) {
+        view.frames.add(
+          timing,
+          displayRefreshRate: _displayRefreshRate(),
+          frozenThreshold: _configuration.frozenFrameThreshold,
+        );
+        view.dirty = true;
+        _sampleMemory(view);
+      }
+      final bool frozen =
+          timing.totalSpan >= _configuration.frozenFrameThreshold;
+      if (_configuration.trackLongTasks &&
+          (frozen || timing.totalSpan >= _configuration.longFrameThreshold)) {
+        _recordLongTask(view, timing, startMicros, frozen: frozen);
+      }
+    } on Object catch (error, stackTrace) {
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM frame recording failed',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
+  void _recordLongTask(
+    ViewScope view,
+    FrameTiming timing,
+    int startMicros, {
+    required bool frozen,
+  }) {
+    view.longTaskCount += 1;
+    if (frozen) view.frozenFrameCount += 1;
+    view.dirty = true;
+    // Timings are reported in batches, and some engines cannot date a frame
+    // exactly; a long task is never dated outside the view it happened in.
+    final int start = min(
+      max(startMicros, view.startedAtMicros),
+      view.startedAtMicros + view.timeSpent.inMicroseconds,
+    );
+    _emit(
+      RumEventKind.longTask,
+      _context.wrap(
+        RumEventKind.longTask,
+        date: start ~/ 1000,
+        view: view,
+        body: longTaskBody(
+          duration: timing.totalSpan,
+          startNanoseconds: nanosecondsOfMicroseconds(
+            start - view.startedAtMicros,
+          ),
+          frozen: frozen,
+        ),
+      ),
+    );
+  }
+
+  /// The end of the first frame built for [view] is its first build complete.
+  void _scheduleFirstBuild(ViewScope view) {
+    if (!_configuration.trackViewPerformance) return;
+    _afterNextFrame((Duration _) {
+      if (_stopped || !view.active || view.firstBuildNanoseconds != null) {
+        return;
+      }
+      view.firstBuildNanoseconds = view.elapsedNanoseconds;
+      view.dirty = true;
+    });
+  }
+
+  /// Measures the cold start at the end of the first frame built for the
+  /// application's own UI. Frames before `runApp` draw nothing, so the
+  /// measurement waits for the root widget.
+  void _scheduleStartup() {
+    if (!_configuration.trackViewPerformance) return;
+    int frames = 0;
+    void onFrame(Duration _) {
+      if (_stopped || _startupRecorded) return;
+      if (WidgetsBinding.instance.rootElement == null && (frames += 1) < 600) {
+        WidgetsBinding.instance.addPostFrameCallback(onFrame);
+        return;
+      }
+      _recordStartup(nowMicros());
+    }
+
+    _afterNextFrame(onFrame);
+  }
+
+  void _afterNextFrame(FrameCallback callback) {
+    try {
+      WidgetsBinding.instance
+        ..addPostFrameCallback(callback)
+        ..ensureVisualUpdate();
+    } on Object {
+      // Without a binding there is no frame to wait for.
+    }
+  }
+
+  /// The first frame drawn after the SDK started is the cold start: an
+  /// `application_start` action and an `app_launch` vital for the time to
+  /// initial display.
+  void _recordStartup(int atMicros) {
+    if (_startupRecorded || !_configuration.trackViewPerformance) return;
+    _startupRecorded = true;
+    final int ttid = nanosecondsOfMicroseconds(atMicros - _startedAtMicros);
+    if (ttid > nanosecondsOf(const Duration(minutes: 10))) return;
+    final RumSession? session = _prepareSession();
+    if (session == null || !session.sampled) return;
+    final ViewScope view = _currentView(session);
+    final ActionScope launch = ActionScope(
+      type: 'application_start',
+      name: 'ApplicationStart',
+      fixedLoadingNanoseconds: ttid,
+    );
+    view.actionCount += 1;
+    view.dirty = true;
+    _emit(
+      RumEventKind.action,
+      _context.wrap(
+        RumEventKind.action,
+        date: _startedAtMicros ~/ 1000,
+        view: view,
+        body: actionBody(launch),
+      ),
+    );
+    _emit(
+      RumEventKind.vital,
+      _context.wrap(
+        RumEventKind.vital,
+        date: _startedAtMicros ~/ 1000,
+        view: view,
+        body: appLaunchVitalBody(ttidNanoseconds: ttid),
+      ),
+    );
+  }
+
+  double _displayRefreshRate() {
+    try {
+      final Iterable<ui.FlutterView> views =
+          WidgetsBinding.instance.platformDispatcher.views;
+      if (views.isNotEmpty) {
+        final double rate = views.first.display.refreshRate;
+        if (rate.isFinite && rate >= 30 && rate <= 360) return rate;
+      }
+    } on Object {
+      // Fall back to the common refresh rate.
+    }
+    return 60;
+  }
+
+  // Lifecycle -----------------------------------------------------------------
+
   @override
   void handleLifecycleState(AppLifecycleState state) {
     if (_stopped) return;
-    if (state == AppLifecycleState.resumed) {
-      _recordAction(const _ActionInput(type: 'lifecycle', name: 'App resumed'));
+    if (_lifecycleIsForeground(state)) {
+      if (_context.inForeground) return;
+      _context.inForeground = true;
+      unawaited(_deviceInfo.refresh());
+      final ViewScope? resume = _resumeView;
+      _resumeView = null;
+      if (resume != null) _showAgain(resume);
       return;
     }
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.hidden ||
-        state == AppLifecycleState.detached) {
-      _recordAction(
-        _ActionInput(
-          type: 'lifecycle',
-          name: 'App ${state.name}',
-          context: <String, Object?>{'state': state.name},
-        ),
-      );
-      if (state == AppLifecycleState.detached) {
-        unawaited(_closeForLifecycle());
-      } else {
-        unawaited(flush());
-      }
+    if (state == AppLifecycleState.inactive) return;
+    // paused, hidden, or detached: the app is no longer on screen.
+    _context.inForeground = false;
+    _completeAction();
+    final ViewScope? view = _view;
+    if (view != null && view.active) {
+      _resumeView = view;
+      _endView(view);
     }
+    unawaited(flush());
   }
+
+  void _showAgain(ViewScope view) {
+    final RumSession? session = _prepareSession();
+    if (session == null || !session.sampled) return;
+    _beginView(
+      key: view.key,
+      name: view.name,
+      session: session,
+      loadingType: view.session.id == session.id
+          ? 'view_controller_redisplay'
+          : 'session_renewal',
+      context: view.context,
+    );
+  }
+
+  bool _lifecycleIsForeground(AppLifecycleState? state) =>
+      state == null ||
+      state == AppLifecycleState.resumed ||
+      state == AppLifecycleState.inactive;
+
+  // Instrumentation helpers ---------------------------------------------------
 
   bool isSdkUrl(Uri url) => _eventTransport.isSdkUrl(url);
 
@@ -553,18 +1286,22 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
   @override
   RumInternalContext getInternalContext() {
     final RumSession session = _sessionManager.current();
+    final ViewScope? view = _view;
     return RumInternalContext(
       applicationId: _configuration.applicationId,
       sessionId: session.sampled ? session.id : null,
-      userId: _currentUserId,
+      viewId: session.sampled && view?.session.id == session.id
+          ? view?.id
+          : null,
+      userId: _context.userId,
       service: _configuration.service,
       environment: _configuration.env,
       version: _configuration.version,
-      platform: _configuration.platform,
-      architecture: _configuration.architecture,
-      debugId: _configuration.debugId,
+      buildId: _configuration.debugId,
     );
   }
+
+  // Session replay ------------------------------------------------------------
 
   @override
   void startSessionReplayRecording() {
@@ -592,8 +1329,60 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
     _replayCapture = null;
   }
 
+  void _syncReplayCapture(RumSession session) {
+    final RumReplayCapture? capture = _replayCapture;
+    if (capture == null) return;
+    if (_isReplayEnabled(session)) {
+      capture.start(session.id, _acceptReplayCapture);
+    } else {
+      capture.stop();
+    }
+  }
+
+  void _acceptReplayCapture(String sessionId, RumContext event) {
+    if (_stopped) return;
+    final RumSession session = _sessionManager.active();
+    if (session.id != sessionId || !_isReplayEnabled(session)) {
+      return;
+    }
+    final RumContext? prepared = _applyReplayBeforeSend(
+      _withReplayBuildMetadata(event),
+    );
+    if (prepared != null &&
+        _eventTransport.enqueueReplay(session.id, prepared)) {
+      if (!session.replayRecorded) {
+        _sessionManager.markReplayRecorded(session.id);
+        // The next report of the view tells the receiver the session has a
+        // replay.
+        _view?.dirty = true;
+      }
+    }
+  }
+
+  void _recordReplayPointer(RumSession session, Offset? position) {
+    if (position == null || !_isReplayEnabled(session)) return;
+    _replayCapture?.recordPointer(position, timestampMilliseconds: nowMillis());
+  }
+
+  void _requestReplayCapture(RumSession session) {
+    if (_configuration.sessionReplay.captureOnAction &&
+        _isReplayEnabled(session)) {
+      _replayCapture?.requestCapture();
+    }
+  }
+
+  bool _isReplayEnabled(RumSession session) {
+    if (!session.sampled) return false;
+    final bool? override = _replayOverride;
+    return override ?? session.replaySampled;
+  }
+
+  // Shutdown ------------------------------------------------------------------
+
   @override
   Future<RumFlushResult> flush() async {
+    _completeAction();
+    _reportDirtyView();
     await _sessionManager.persistNow();
     return _eventTransport.flush();
   }
@@ -613,381 +1402,27 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
   Future<RumFlushResult> _stop() async {
     try {
       if (_stopped) return const RumFlushResult();
-      final RumSession session = await _sessionManager.closeCurrent(
-        reason: 'stopped',
-      );
-      _reportFinalSession(session);
+      _completeAction();
+      final ViewScope? view = _view;
+      if (view != null) _endView(view);
       await _sessionManager.persistNow();
       _stopped = true;
+      _resources.clear();
+      _vitals.clear();
       _replayCapture?.stop();
       _instrumentation.stop();
+      await _deviceInfo.close();
       return await _eventTransport.stop();
     } finally {
       _stopCompleted = true;
     }
   }
 
-  Future<void> _closeForLifecycle() async {
-    final RumSession session = await _sessionManager.closeCurrent(
-      reason: 'detached',
-    );
-    _reportFinalSession(session);
-    await flush();
-  }
+  // Events --------------------------------------------------------------------
 
-  void _recordAction(_ActionInput input) {
-    if (_stopped) return;
-    try {
-      final RumSession? session = _prepareSession();
-      if (session == null || !session.sampled) return;
-      final int timestamp = input.timestampMicros ?? nowMicros();
-      if (!_validEpochMicros(timestamp) ||
-          (input.durationUs != null && !_validMetricValue(input.durationUs!))) {
-        reportDiagnostic(
-          _configuration.onError,
-          'RUM action dropped: invalid timestamp or duration',
-        );
-        return;
-      }
-      switch (input.type) {
-        case 'view':
-          _sessionManager.recordView(session, _currentViewPath);
-          break;
-        case 'resource':
-          _sessionManager.recordResource(session);
-          break;
-        case 'error' ||
-            'view_performance' ||
-            'performance' ||
-            'long_task' ||
-            'frozen_frame':
-          break;
-        default:
-          _sessionManager.recordAction(session);
-      }
-      final RumContext payload = _compact(<String, Object?>{
-        ...sanitizeContext(_globalContext),
-        ...sanitizeContext(input.context),
-        if (_currentViewPath.isNotEmpty) 'path': _currentViewPath,
-        'application': _configuration.applicationId,
-        'environment': _configuration.env,
-        'version': _configuration.version,
-        'platform': _configuration.platform,
-        'architecture': _configuration.architecture,
-        'debug_id': _configuration.debugId,
-        'browser': _environment['browser'],
-        'os': _environment['os'],
-        'device': _environment['device'],
-        if (_user != null) 'user': sanitizeContext(_user!.toJson()),
-      });
-      final RumContext event = _compact(<String, Object?>{
-        ..._commonFields(timestamp, session),
-        'timestamp': timestamp,
-        'session_id': session.id,
-        'ts_micros': timestamp,
-        'type': input.type,
-        'name': input.name,
-        if (_currentViewPath.isNotEmpty) 'page': _currentViewPath,
-        'url': input.url,
-        'duration_ms': input.durationMs,
-        'duration_us': input.durationUs,
-        'status': input.status,
-        'trace_id': input.traceContext?.traceId,
-        'parent_span_id': input.traceContext?.parentSpanId,
-        'service': _configuration.service,
-        'payload': payload,
-      });
-      _enqueue(RumEventKind.action, event);
-      if (_isReplayEnabled(session)) {
-        _recordReplay(
-          session,
-          _compact(<String, Object?>{
-            'type': input.type,
-            'ts': timestamp ~/ 1000,
-            if (_currentViewPath.isNotEmpty) 'href': replayPage,
-            'url': input.url,
-            'name': input.name,
-            'selector': input.context['selector'],
-            'duration_ms': input.durationMs,
-            'duration_us': input.durationUs,
-            'status': input.status,
-            'payload': sanitizeContext(input.context),
-          }),
-        );
-        final Object? x = input.context['x'];
-        final Object? y = input.context['y'];
-        if (x is num && y is num) {
-          _replayCapture?.recordPointer(
-            Offset(x.toDouble(), y.toDouble()),
-            timestampMilliseconds: timestamp ~/ 1000,
-          );
-        }
-        if (_configuration.sessionReplay.captureOnAction) {
-          _replayCapture?.requestCapture();
-        }
-      }
-    } on Object catch (error, stackTrace) {
-      reportDiagnostic(
-        _configuration.onError,
-        'RUM action recording failed',
-        error,
-        stackTrace,
-      );
-    }
-  }
-
-  void _recordError(
-    Object error, {
-    StackTrace? stackTrace,
-    required List<RumStackFrame> frames,
-    required RumContext context,
-    required String source,
-  }) {
-    if (_stopped) return;
-    try {
-      final RumSession? session = _prepareSession();
-      if (session == null || !session.sampled) return;
-      final error_description.ErrorDescription details = error_description
-          .describeError(
-            error,
-            stackTrace,
-            platform: _configuration.platform,
-            debugId: _configuration.debugId,
-          );
-      final List<Map<String, Object?>> serializedFrames = <RumStackFrame>[
-        ...frames,
-        ...details.stack,
-      ].take(100).map(_sanitizeFrame).toList(growable: false);
-      final String signature = <String>[
-        details.type,
-        details.message,
-        ...serializedFrames
-            .take(3)
-            .map((Map<String, Object?> frame) => frame.toString()),
-      ].join('|');
-      final int nowMilliseconds = DateTime.now().millisecondsSinceEpoch;
-      final int? previous = _recentErrors[signature];
-      if (previous != null && nowMilliseconds - previous < 1000) return;
-      _recentErrors[signature] = nowMilliseconds;
-      _pruneRecentErrors(nowMilliseconds);
-
-      final int timestamp = nowMicros();
-      _visualChangeId += 1;
-      _sessionManager.recordError(session, crash: source == 'platform');
-      final String fingerprint = 'fp_${fnv1a(signature)}';
-      final RumContext errorContext = _compact(<String, Object?>{
-        ...sanitizeContext(_globalContext),
-        ...sanitizeContext(context),
-        'source': source,
-        if (_currentViewPath.isNotEmpty) 'page': _currentViewPath,
-      });
-      final RumContext event = _compact(<String, Object?>{
-        ..._commonFields(timestamp, session),
-        'timestamp': timestamp,
-        'session_id': session.id,
-        'user_id': _currentUserId,
-        'fingerprint': fingerprint,
-        'message': details.message,
-        if (_currentViewPath.isNotEmpty) 'page': _currentViewPath,
-        if (_currentViewPath.isNotEmpty) 'url': _currentViewPath,
-        'application': _configuration.applicationId,
-        'environment': _configuration.env,
-        'version': _configuration.version,
-        'release': _configuration.version,
-        'service': _configuration.service,
-        'error_type': details.type,
-        'error': _compact(<String, Object?>{
-          'type': details.type,
-          'message': details.message,
-          'stack': serializedFrames,
-          if (_configuration.defaultPrivacyLevel == RumPrivacyLevel.allow)
-            'raw_stack': details.rawStack,
-          'context': errorContext,
-        }),
-        'context': errorContext,
-      });
-      _enqueue(RumEventKind.error, event);
-      _recordAction(
-        _ActionInput(
-          type: 'error',
-          name: details.message,
-          timestampMicros: timestamp,
-          context: <String, Object?>{
-            'fingerprint': fingerprint,
-            'error_type': details.type,
-            'source': source,
-          },
-        ),
-      );
-    } on Object catch (recordingError, recordingStack) {
-      reportDiagnostic(
-        _configuration.onError,
-        'RUM error recording failed',
-        recordingError,
-        recordingStack,
-      );
-    }
-  }
-
-  RumSession? _prepareSession() {
-    if (_stopped) return null;
-    final SessionResult result = _sessionManager.ensure();
-    for (final RumSession closed in result.closedSessions) {
-      _reportFinalSession(closed);
-    }
-    if (result.created) {
-      _replayOverride = null;
-      _recentErrors.clear();
-    }
-    _syncReplayCapture(result.session);
-    if (result.session.sampled && !result.session.reported) {
-      _reportSessionStart(result.session);
-    }
-    return result.session;
-  }
-
-  void _reportRecoveredSessions() {
-    for (final RumSession session in _sessionManager.pendingFinalizations()) {
-      _reportFinalSession(session);
-    }
-  }
-
-  void _syncReplayCapture(RumSession session) {
-    final RumReplayCapture? capture = _replayCapture;
-    if (capture == null) return;
-    if (_isReplayEnabled(session)) {
-      capture.start(session.id, _acceptReplayCapture, _markVisualChange);
-    } else {
-      capture.stop();
-    }
-  }
-
-  void _acceptReplayCapture(String sessionId, RumContext event) {
-    if (_stopped) return;
-    final RumSession session = _sessionManager.active();
-    if (session.id != sessionId || !_isReplayEnabled(session)) {
-      return;
-    }
-    final RumContext? prepared = _applyReplayBeforeSend(
-      _withReplayBuildMetadata(event),
-    );
-    if (prepared != null) {
-      _eventTransport.enqueueReplay(session.id, prepared);
-    }
-  }
-
-  void _recordReplay(RumSession session, RumContext event) {
-    if (!_isReplayEnabled(session)) return;
-    final RumContext? prepared = _applyReplayBeforeSend(
-      _withReplayBuildMetadata(event),
-    );
-    if (prepared != null) {
-      _eventTransport.enqueueReplay(session.id, prepared);
-    }
-  }
-
-  bool _isReplayEnabled(RumSession session) {
-    if (!session.sampled) return false;
-    final bool? override = _replayOverride;
-    return override ?? session.replaySampled;
-  }
-
-  void _markVisualChange() {
-    _visualChangeId += 1;
-  }
-
-  void _reportSessionStart(RumSession session) {
-    final int timestamp = session.startedAtMicros;
-    final RumContext event = _compact(<String, Object?>{
-      ..._commonFields(timestamp, session),
-      'timestamp': timestamp,
-      'session_id': session.id,
-      'user_id': _currentUserId,
-      'started_at': timestamp,
-      'started_at_micros': timestamp,
-      'phase': 'start',
-      'application': _configuration.applicationId,
-      'app_version': _configuration.version,
-      'environment': _configuration.env,
-      'version': _configuration.version,
-      'service': _configuration.service,
-      if (session.landingPage != null || _currentViewPath.isNotEmpty)
-        'landing_page': session.landingPage ?? _currentViewPath,
-      if (session.lastPage != null || _currentViewPath.isNotEmpty)
-        'last_page': session.lastPage ?? _currentViewPath,
-      if (_user != null) 'user': sanitizeContext(_user!.toJson()),
-      'context': sanitizeContext(_globalContext),
-    });
-    if (_enqueue(RumEventKind.session, event)) {
-      _sessionManager.markReported(session.id);
-    }
-  }
-
-  void _reportFinalSession(RumSession session) {
-    if (session.finalReported) return;
-    if (!session.sampled) {
-      _sessionManager.markFinalReported(session.id);
-      return;
-    }
-    final int timestamp = session.endedAtMicros ?? session.lastActivityMicros;
-    final RumContext event = _compact(<String, Object?>{
-      ..._commonFields(timestamp, session),
-      'timestamp': timestamp,
-      'session_id': session.id,
-      'phase': 'end',
-      'started_at': session.startedAtMicros,
-      'started_at_micros': session.startedAtMicros,
-      'ended_at_micros': timestamp,
-      'last_activity_micros': session.lastActivityMicros,
-      'duration_us': session.durationMicros,
-      'duration_ms': session.durationMicros / 1000,
-      'view_count': session.viewCount,
-      'action_count': session.actionCount,
-      'error_count': session.errorCount,
-      'resource_count': session.resourceCount,
-      'crashed': session.crashed,
-      'end_reason': session.endReason ?? 'unknown',
-      if (session.landingPage != null) 'landing_page': session.landingPage,
-      if (session.lastPage != null) 'last_page': session.lastPage,
-      if (_user != null) 'user': sanitizeContext(_user!.toJson()),
-      'context': sanitizeContext(_globalContext),
-    });
-    if (_enqueue(RumEventKind.session, event)) {
-      _sessionManager.markFinalReported(session.id);
-    }
-  }
-
-  RumContext _commonFields(int timestamp, RumSession session) =>
-      _compact(<String, Object?>{
-        'timestamp': timestamp,
-        'session_id': session.id,
-        'session_sequence': _sessionManager.nextEventSequence(session.id),
-        'application': _configuration.applicationId,
-        'environment': _configuration.env,
-        'version': _configuration.version,
-        'service': _configuration.service,
-        'platform': _configuration.platform,
-        'architecture': _configuration.architecture,
-        'debug_id': _configuration.debugId,
-        'framework': 'flutter',
-        'runtime': 'flutter',
-        'user_id': _currentUserId,
-        'anonymous_id': _anonymousUserId,
-        'browser': _environment['browser'],
-        'os': _environment['os'],
-        'device': _environment['device'],
-        'language': _environment['language'],
-        'timezone': _environment['timezone'],
-        'viewport': _environment['viewport'],
-        'sdk_name': 'molesignal_flutter',
-        'sdk_version': '0.3.0',
-      });
-
-  String? get _currentUserId => _user?.id ?? _anonymousUserId;
-
-  bool _enqueue(RumEventKind kind, RumContext event) {
+  bool _emit(RumEventKind kind, RumContext event) {
     final RumContext? prepared = _applyBeforeSend(kind, event);
-    return prepared != null && _eventTransport.enqueue(kind, prepared);
+    return prepared != null && _eventTransport.enqueue(prepared);
   }
 
   RumContext? _applyBeforeSend(RumEventKind kind, RumContext event) {
@@ -1053,117 +1488,22 @@ final class MoleSignalRumClient implements RumClient, RumInstrumentationSink {
     return result;
   }
 
-  void _pruneRecentErrors(int nowMilliseconds) {
-    if (_recentErrors.length < 100) return;
-    _recentErrors.removeWhere(
-      (String _, int timestamp) => nowMilliseconds - timestamp > 60000,
-    );
+  RumSession? _prepareSession() {
+    if (_stopped) return null;
+    final SessionResult result = _sessionManager.resolve();
+    if (result.created) {
+      _replayOverride = null;
+      _recentErrors.clear();
+      _taps.clear();
+      if (!result.session.sampled) {
+        // Nothing of the new session is recorded, so the view of the old one
+        // is not renewed; close it under its own session.
+        _completeAction();
+        final ViewScope? old = _view;
+        if (old != null) _endView(old);
+      }
+    }
+    _syncReplayCapture(result.session);
+    return result.session;
   }
-
-  Map<String, Object?> _sanitizeFrame(RumStackFrame frame) {
-    final RumArtifactKind artifactKind = _configuration.platform == 'flutter'
-        ? RumArtifactKind.javascriptSourcemap
-        : frame.artifactKind;
-    return _compact(<String, Object?>{
-      'artifact_kind': artifactKind.wireName,
-      if (frame.module != null) 'module': _frameModule(frame.module!),
-      if (frame.function != null)
-        'function': sanitizeText(frame.function!, limit: 1024),
-      if (frame.file != null) 'file': sanitizeStackFile(frame.file!),
-      if (frame.line != null) 'line': frame.line! < 1 ? 1 : frame.line,
-      if (frame.column != null) 'column': frame.column! < 1 ? 1 : frame.column,
-      if (_configuration.platform != 'flutter')
-        'instruction_addr': _frameAddress(frame.instructionAddress),
-      if (_configuration.platform != 'flutter')
-        'image_addr': _frameAddress(frame.imageAddress),
-      if (_configuration.platform != 'flutter')
-        'relative_address': _frameAddress(frame.relativeAddress),
-      'debug_id': sanitizeText(
-        frame.debugId ?? _configuration.debugId,
-        limit: 128,
-      ),
-    });
-  }
-
-  String _frameModule(String value) {
-    final String safe = sanitizeStackFile(value).replaceAll('\\', '/');
-    final int slash = safe.lastIndexOf('/');
-    return sanitizeText(
-      slash < 0 ? safe : safe.substring(slash + 1),
-      limit: 256,
-    );
-  }
-
-  String? _frameAddress(String? value) {
-    final String normalized = value?.trim().toLowerCase() ?? '';
-    if (normalized.isEmpty) return null;
-    final String digits = normalized.startsWith('0x')
-        ? normalized.substring(2)
-        : normalized;
-    if (!RegExp(r'^[0-9a-f]+$').hasMatch(digits)) return null;
-    final int? parsed = int.tryParse(digits, radix: 16);
-    return parsed == null ? null : '0x${parsed.toRadixString(16)}';
-  }
-}
-
-final class _ActionInput {
-  const _ActionInput({
-    required this.type,
-    this.name,
-    this.url,
-    this.durationMs,
-    this.durationUs,
-    this.status,
-    this.timestampMicros,
-    this.traceContext,
-    this.context = const <String, Object?>{},
-  });
-
-  final String type;
-  final String? name;
-  final String? url;
-  final double? durationMs;
-  final int? durationUs;
-  final int? status;
-  final int? timestampMicros;
-  final RumTraceContext? traceContext;
-  final RumContext context;
-}
-
-final class _InteractionSample {
-  const _InteractionSample(this.timestampMicros, this.x, this.y);
-
-  factory _InteractionSample.fromContext(int timestamp, RumContext context) {
-    final Object? x = context['x'];
-    final Object? y = context['y'];
-    return _InteractionSample(
-      timestamp,
-      x is num ? x.toDouble() : null,
-      y is num ? y.toDouble() : null,
-    );
-  }
-
-  final int timestampMicros;
-  final double? x;
-  final double? y;
-
-  bool isNear(Offset position) {
-    if (x == null || y == null) return true;
-    return (Offset(x!, y!) - position).distance <= 18;
-  }
-}
-
-const int _maximumSafeJsonInteger = 9007199254740991;
-
-bool _validEpochMicros(int value) =>
-    value > 0 && value <= _maximumSafeJsonInteger;
-
-bool _validMetricValue(num value) {
-  final double converted = value.toDouble();
-  return converted.isFinite && converted.abs() <= _maximumSafeJsonInteger;
-}
-
-RumContext _compact(RumContext value) {
-  value.removeWhere((String _, Object? entry) => entry == null);
-  return value;
 }

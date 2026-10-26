@@ -7,8 +7,23 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:molesignal_flutter/molesignal_flutter.dart';
 import 'package:molesignal_flutter/src/replay/capture.dart';
 
-const String _clientToken =
-    'msrum_aB3kZ1xT9pQrU7nM_dFgHjKl8eRvNcWxYz4tBmEqPaS2vG6Qz';
+import 'support/configuration.dart';
+import 'support/recording_transport.dart';
+
+RumConfiguration _configuration(
+  RumTransport transport, {
+  double replaySampleRate = 0,
+  RumSessionReplayConfiguration replay = const RumSessionReplayConfiguration(),
+  double sessionSampleRate = 100,
+  MemoryRumPersistence? persistence,
+}) => testConfiguration(
+  transport,
+  applicationId: 'replay-mobile',
+  sessionSampleRate: sessionSampleRate,
+  sessionReplaySampleRate: replaySampleRate,
+  sessionReplay: replay,
+  persistence: persistence,
+);
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -16,7 +31,7 @@ void main() {
   testWidgets(
     'RumApp emits playable rrweb snapshots after masking Flutter text',
     (WidgetTester tester) async {
-      final _RecordingTransport transport = _RecordingTransport();
+      final RecordingTransport transport = RecordingTransport();
       final MoleSignalRumClient client = await initRum(
         _configuration(
           transport,
@@ -49,12 +64,17 @@ void main() {
           ),
         );
 
-        await _waitForReplay(tester, transport);
+        await _waitForReplay(tester, transport, client);
         final Map<String, dynamic> segment = _replaySegment(
           transport.replayRequests.single,
         );
-        expect(segment['session_id'], startsWith('ses_'));
+        expect(segment['session_id'], matches(RegExp(r'^[0-9a-f-]{36}$')));
+        expect(segment['application'], 'replay-mobile');
         expect(segment['seq'], 1);
+        // A segment says where its session runs, as the events of the session do.
+        expect(segment['service'], 'checkout-app');
+        expect(segment['env'], 'production');
+        expect(segment['version'], '1.2.3+4');
         final List<Map<String, dynamic>> events = _replayEvents(segment);
         expect(
           events.map((Map<String, dynamic> event) => event['type']),
@@ -107,7 +127,7 @@ void main() {
   test(
     'manual replay override records a zero-replay-sampled session',
     () async {
-      final _RecordingTransport transport = _RecordingTransport();
+      final RecordingTransport transport = RecordingTransport();
       final MoleSignalRumClient client = await initRum(
         _configuration(transport, replaySampleRate: 0),
       );
@@ -130,8 +150,31 @@ void main() {
     },
   );
 
+  test('a session that is not sampled records no replay at all', () async {
+    final RecordingTransport transport = RecordingTransport();
+    final MoleSignalRumClient client = await initRum(
+      _configuration(transport, replaySampleRate: 100, sessionSampleRate: 0),
+    );
+    try {
+      client.attachReplayCapture(_FakeReplayCapture());
+      client.startSessionReplayRecording();
+      await client.flush();
+      expect(transport.requests, isEmpty);
+    } finally {
+      await client.stop();
+    }
+  });
+
   test('replay retry preserves the assigned sequence and payload', () async {
-    final _RetryReplayTransport transport = _RetryReplayTransport();
+    int calls = 0;
+    final RecordingTransport transport = RecordingTransport(
+      respond: (RumTransportRequest request) {
+        if (request.kind == RumUploadKind.replay && (calls += 1) == 1) {
+          return const RumTransportResponse(ok: false, status: 503);
+        }
+        return const RumTransportResponse(ok: true, status: 202);
+      },
+    );
     final MoleSignalRumClient client = await initRum(
       _configuration(transport, replaySampleRate: 100),
     );
@@ -155,7 +198,12 @@ void main() {
     'replay segment survives restart with the same sequence and payload',
     () async {
       final MemoryRumPersistence persistence = MemoryRumPersistence();
-      final _AlwaysRetryReplayTransport failing = _AlwaysRetryReplayTransport();
+      final RecordingTransport failing = RecordingTransport(
+        respond: (RumTransportRequest request) =>
+            request.kind == RumUploadKind.replay
+            ? const RumTransportResponse(ok: false, status: 503)
+            : const RumTransportResponse(ok: true, status: 202),
+      );
       final MoleSignalRumClient first = await initRum(
         _configuration(
           failing,
@@ -168,7 +216,7 @@ void main() {
       final String original = failing.replayRequests.first.body;
       await first.stop();
 
-      final _RecordingTransport recovered = _RecordingTransport();
+      final RecordingTransport recovered = RecordingTransport();
       final MoleSignalRumClient second = await initRum(
         _configuration(
           recovered,
@@ -194,97 +242,104 @@ void main() {
     },
   );
 
-  testWidgets('RumApp records automatic taps and rage clicks', (
-    WidgetTester tester,
-  ) async {
-    final _RecordingTransport transport = _RecordingTransport();
-    final MoleSignalRumClient client = await initRum(
-      _configuration(
-        transport,
-        trackUserInteractions: true,
-        trackFrustrations: true,
-      ),
-    );
-    int presses = 0;
-    try {
-      await tester.pumpWidget(
-        RumApp(
-          client: client,
-          child: MaterialApp(
-            home: Scaffold(
-              body: Center(
-                child: TextButton(
-                  onPressed: () => presses += 1,
-                  child: const Text('Tap target'),
-                ),
-              ),
-            ),
-          ),
-        ),
+  group('session.has_replay', () {
+    test('is false until a replay event has been recorded', () async {
+      final RecordingTransport transport = RecordingTransport();
+      final MoleSignalRumClient client = await initRum(
+        _configuration(transport, replaySampleRate: 0),
       );
-      await tester.pump();
-      for (int index = 0; index < 3; index += 1) {
-        await tester.tap(find.text('Tap target'));
-        await tester.pump(const Duration(milliseconds: 50));
-      }
-      await client.flush();
+      try {
+        client.startView('/a');
+        await client.flush();
 
-      expect(presses, 3);
-      final List<Map<String, dynamic>> actions = transport.actions;
-      expect(
-        actions.where((Map<String, dynamic> event) => event['type'] == 'tap'),
-        hasLength(3),
+        expect(at(transport.latestViews.single, 'session.has_replay'), isFalse);
+      } finally {
+        await client.stop();
+      }
+    });
+
+    test('is true on views that start after recording began', () async {
+      final RecordingTransport transport = RecordingTransport();
+      final MoleSignalRumClient client = await initRum(
+        _configuration(transport, replaySampleRate: 100),
       );
-      expect(
-        actions.any(
-          (Map<String, dynamic> event) => event['type'] == 'rage_click',
-        ),
-        isTrue,
+      try {
+        client.attachReplayCapture(_FakeReplayCapture());
+        client.startView('/a');
+        await client.flush();
+
+        expect(at(transport.latestViews.single, 'session.has_replay'), isTrue);
+      } finally {
+        await client.stop();
+      }
+    });
+
+    test(
+      'is reported again on the running view once recording began',
+      () async {
+        final RecordingTransport transport = RecordingTransport();
+        final MoleSignalRumClient client = await initRum(
+          _configuration(transport, replaySampleRate: 100),
+        );
+        try {
+          client.startView('/a');
+          await client.flush();
+          expect(
+            at(transport.latestViews.single, 'session.has_replay'),
+            isFalse,
+          );
+
+          client.attachReplayCapture(_FakeReplayCapture());
+          await client.flush();
+          expect(
+            at(transport.latestViews.single, 'session.has_replay'),
+            isTrue,
+          );
+          expect(at(transport.latestViews.single, 'view.revision'), 2);
+        } finally {
+          await client.stop();
+        }
+      },
+    );
+
+    test('replay events carry the build identity and no RUM records', () async {
+      final RecordingTransport transport = RecordingTransport();
+      final MoleSignalRumClient client = await initRum(
+        _configuration(transport, replaySampleRate: 100),
       );
-    } finally {
-      await tester.pumpWidget(const SizedBox.shrink());
-      await client.stop();
-    }
+      try {
+        client.attachReplayCapture(_FakeReplayCapture());
+        client.startView('/a');
+        client.addAction('Tap');
+        await client.flush();
+
+        final List<Map<String, dynamic>> events = _replayEvents(
+          _replaySegment(transport.replayRequests.single),
+        );
+        expect(events, isNotEmpty);
+        for (final Map<String, dynamic> event in events) {
+          expect(event['type'], isA<int>(), reason: 'only rrweb records');
+          expect(event['application'], 'replay-mobile');
+          expect(event['service'], 'checkout-app');
+          expect(event['version'], '1.2.3+4');
+          expect(event['platform'], 'android');
+          expect(event['architecture'], 'arm64');
+          expect(event['debug_id'], 'build-android-arm64-42');
+        }
+      } finally {
+        await client.stop();
+      }
+    });
   });
 }
 
-RumConfiguration _configuration(
-  RumTransport transport, {
-  double replaySampleRate = 0,
-  RumSessionReplayConfiguration replay = const RumSessionReplayConfiguration(),
-  bool trackUserInteractions = false,
-  bool? trackFrustrations,
-  MemoryRumPersistence? persistence,
-}) => RumConfiguration(
-  applicationId: 'replay-mobile',
-  clientToken: _clientToken,
-  site: 'https://rum.example.test',
-  service: 'replay-app',
-  version: '1.0.0',
-  platform: 'android',
-  architecture: 'arm64',
-  debugId: 'replay-build',
-  sessionReplaySampleRate: replaySampleRate,
-  sessionReplay: replay,
-  trackUserInteractions: trackUserInteractions,
-  trackFrustrations: trackFrustrations,
-  trackFlutterErrors: false,
-  trackPlatformErrors: false,
-  trackAppLifecycle: false,
-  trackLongTasks: false,
-  trackViewPerformance: false,
-  trackAnonymousUser: false,
-  flushInterval: const Duration(minutes: 1),
-  replayFlushInterval: const Duration(minutes: 1),
-  transport: transport,
-  persistence: persistence ?? MemoryRumPersistence(),
-);
-
 Future<void> _waitForReplay(
   WidgetTester tester,
-  _RecordingTransport transport,
+  RecordingTransport transport,
+  MoleSignalRumClient client,
 ) async {
   for (int attempt = 0; attempt < 40; attempt += 1) {
+    await client.flush();
     if (transport.replayRequests.isNotEmpty) return;
     await tester.pump(const Duration(milliseconds: 25));
     await tester.runAsync(
@@ -325,70 +380,12 @@ String _snapshotImageUrl(Map<String, dynamic> fullSnapshot) {
   return attributes['src']! as String;
 }
 
-class _RecordingTransport extends RumTransport {
-  final List<RumTransportRequest> requests = <RumTransportRequest>[];
-
-  List<RumTransportRequest> get replayRequests => requests
-      .where(
-        (RumTransportRequest request) => request.kind == RumEventKind.replay,
-      )
-      .toList(growable: false);
-
-  List<Map<String, dynamic>> get actions => requests
-      .where(
-        (RumTransportRequest request) => request.kind == RumEventKind.action,
-      )
-      .expand(
-        (RumTransportRequest request) =>
-            (jsonDecode(request.body) as List<dynamic>).map(
-              (dynamic event) =>
-                  Map<String, dynamic>.from(event as Map<dynamic, dynamic>),
-            ),
-      )
-      .toList(growable: false);
-
-  @override
-  Future<RumTransportResponse> send(RumTransportRequest request) async {
-    requests.add(request);
-    return const RumTransportResponse(ok: true, status: 200);
-  }
-}
-
-final class _RetryReplayTransport extends _RecordingTransport {
-  bool _rejected = false;
-
-  @override
-  Future<RumTransportResponse> send(RumTransportRequest request) async {
-    requests.add(request);
-    if (request.kind == RumEventKind.replay && !_rejected) {
-      _rejected = true;
-      return const RumTransportResponse(ok: false, status: 503);
-    }
-    return const RumTransportResponse(ok: true, status: 200);
-  }
-}
-
-final class _AlwaysRetryReplayTransport extends _RecordingTransport {
-  @override
-  Future<RumTransportResponse> send(RumTransportRequest request) async {
-    requests.add(request);
-    if (request.kind == RumEventKind.replay) {
-      return const RumTransportResponse(ok: false, status: 503);
-    }
-    return const RumTransportResponse(ok: true, status: 200);
-  }
-}
-
 final class _FakeReplayCapture implements RumReplayCapture {
   String? _sessionId;
   bool active = false;
 
   @override
-  void start(
-    String sessionId,
-    RumReplayEmit emit,
-    void Function() onVisualChange,
-  ) {
+  void start(String sessionId, RumReplayEmit emit) {
     if (active && _sessionId == sessionId) return;
     active = true;
     _sessionId = sessionId;
@@ -427,7 +424,4 @@ final class _FakeReplayCapture implements RumReplayCapture {
 
   @override
   void requestCapture() {}
-
-  @override
-  Future<int?> visualFingerprint({bool refresh = false}) async => null;
 }

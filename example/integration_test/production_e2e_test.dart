@@ -53,7 +53,7 @@ void main() {
         trackAnonymousUser: false,
       ),
     );
-    rum.startView('Production E2E', path: '/production-e2e');
+    rum.startView('/production-e2e', name: 'Production E2E');
 
     try {
       _throwDartReleaseFailure();

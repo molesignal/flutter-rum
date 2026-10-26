@@ -9,13 +9,12 @@ RumTraceContext? parseTraceparent(String? value) {
   if (value == null) return null;
   final RegExpMatch? match = _traceparent.firstMatch(value.trim());
   final String? traceId = match?.group(1)?.toLowerCase();
-  final String? parentSpanId = match?.group(2)?.toLowerCase();
-  if (traceId == null || parentSpanId == null) return null;
-  if (RegExp(r'^0+$').hasMatch(traceId) ||
-      RegExp(r'^0+$').hasMatch(parentSpanId)) {
+  final String? spanId = match?.group(2)?.toLowerCase();
+  if (traceId == null || spanId == null) return null;
+  if (RegExp(r'^0+$').hasMatch(traceId) || RegExp(r'^0+$').hasMatch(spanId)) {
     return null;
   }
-  return RumTraceContext(traceId: traceId, parentSpanId: parentSpanId);
+  return RumTraceContext(traceId: traceId, spanId: spanId);
 }
 
 String? traceparentFromServerTiming(String? value) {

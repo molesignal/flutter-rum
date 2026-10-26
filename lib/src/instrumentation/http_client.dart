@@ -4,7 +4,6 @@ import 'package:http/http.dart' as http;
 
 import '../client.dart';
 import '../internal/trace_context.dart';
-import '../internal/transport_error.dart';
 import '../models.dart';
 
 /// A composable `package:http` client that records outgoing resources.
@@ -15,6 +14,7 @@ final class MoleSignalHttpClient extends http.BaseClient {
   final MoleSignalRumClient rum;
   final http.Client _inner;
   final bool closeInner;
+  int _requests = 0;
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
@@ -24,8 +24,9 @@ final class MoleSignalHttpClient extends http.BaseClient {
       return _inner.send(request);
     }
 
-    final Stopwatch stopwatch = Stopwatch()..start();
+    final String key = 'http_${identityHashCode(this)}_${_requests++}';
     final String? requestTraceparent = _header(request.headers, 'traceparent');
+    rum.startResource(key, request.method, request.url);
     try {
       final http.StreamedResponse response = await _inner.send(request);
       final RumTraceContext? traceContext = rum.shouldReadTrace(request.url)
@@ -40,31 +41,24 @@ final class MoleSignalHttpClient extends http.BaseClient {
       int responseBytes = 0;
       bool finished = false;
 
-      void finish({NormalizedTransportError? error, bool cancelled = false}) {
+      void finish({Object? error}) {
         if (finished) return;
         finished = true;
-        stopwatch.stop();
-        final bool httpError = response.statusCode >= 400;
-        rum.addResource(
-          RumResource(
-            method: request.method,
-            url: request.url,
-            duration: stopwatch.elapsed,
-            status: response.statusCode,
-            requestSize: request.contentLength,
-            responseSize: responseBytes,
+        if (error == null) {
+          rum.stopResource(
+            key,
+            statusCode: response.statusCode,
+            size: responseBytes,
             traceContext: traceContext,
-            initiator: 'package:http',
-            errorType: error?.type ?? (httpError ? 'http' : null),
-            errorCode:
-                error?.code ??
-                (httpError ? 'http_${response.statusCode}' : null),
-            errorMessage: error?.message,
-            context: <String, Object?>{
-              'body_completed': !cancelled && error == null,
-            },
-          ),
-        );
+          );
+        } else {
+          rum.stopResourceWithError(
+            key,
+            error,
+            statusCode: response.statusCode,
+            traceContext: traceContext,
+          );
+        }
       }
 
       late final StreamController<List<int>> controller;
@@ -78,7 +72,7 @@ final class MoleSignalHttpClient extends http.BaseClient {
               controller.add(chunk);
             },
             onError: (Object error, StackTrace stackTrace) {
-              finish(error: normalizeTransportError(error));
+              finish(error: error);
               controller.addError(error, stackTrace);
             },
             onDone: () {
@@ -92,14 +86,7 @@ final class MoleSignalHttpClient extends http.BaseClient {
         onResume: () => subscription?.resume(),
         onCancel: () async {
           await subscription?.cancel();
-          finish(
-            error: const NormalizedTransportError(
-              'cancel',
-              'cancelled',
-              'response body consumption cancelled',
-            ),
-            cancelled: true,
-          );
+          finish(error: const _ResponseCancelled());
         },
       );
 
@@ -114,25 +101,12 @@ final class MoleSignalHttpClient extends http.BaseClient {
         reasonPhrase: response.reasonPhrase,
       );
     } on Object catch (error, stackTrace) {
-      stopwatch.stop();
-      final NormalizedTransportError normalized = normalizeTransportError(
+      rum.stopResourceWithError(
+        key,
         error,
-      );
-      rum.addResource(
-        RumResource(
-          method: request.method,
-          url: request.url,
-          duration: stopwatch.elapsed,
-          requestSize: request.contentLength,
-          traceContext: rum.shouldReadTrace(request.url)
-              ? parseTraceparent(requestTraceparent)
-              : null,
-          initiator: 'package:http',
-          errorType: normalized.type,
-          errorCode: normalized.code,
-          errorMessage: normalized.message,
-          context: const <String, Object?>{'body_completed': false},
-        ),
+        traceContext: rum.shouldReadTrace(request.url)
+            ? parseTraceparent(requestTraceparent)
+            : null,
       );
       Error.throwWithStackTrace(error, stackTrace);
     }
@@ -142,6 +116,14 @@ final class MoleSignalHttpClient extends http.BaseClient {
   void close() {
     if (closeInner) _inner.close();
   }
+}
+
+/// The caller stopped reading the response body; not a failure of the request.
+final class _ResponseCancelled implements Exception {
+  const _ResponseCancelled();
+
+  @override
+  String toString() => 'response body consumption cancelled';
 }
 
 String? _header(Map<String, String> headers, String name) {

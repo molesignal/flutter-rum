@@ -7,18 +7,27 @@ import 'package:flutter/foundation.dart' show compute;
 import '../configuration.dart';
 import '../internal/diagnostics.dart';
 import '../internal/identifiers.dart';
+import '../internal/sanitization.dart';
 import '../models.dart';
 import 'default_transport.dart';
+import 'upload_response.dart';
 
 const int _maximumBatchBytes = 48 * 1024;
+const int _maximumEventBytes = 1024 * 1024;
 const int _targetReplaySegmentBytes = 1024 * 1024;
 const int _maximumReplayRequestBytes = 8 * 1024 * 1024;
+const int _maximumRejectionDiagnostics = 10;
+const int _stateVersion = 2;
 
-const List<RumEventKind> _ingestKinds = <RumEventKind>[
-  RumEventKind.session,
-  RumEventKind.action,
-  RumEventKind.error,
-];
+/// The contract's event types; anything else in a restored queue is stale.
+const Set<String> _eventTypes = <String>{
+  'view',
+  'action',
+  'error',
+  'resource',
+  'long_task',
+  'vital',
+};
 
 final class EventTransport {
   EventTransport._(
@@ -26,8 +35,8 @@ final class EventTransport {
     this._persistence,
     this._nextReplaySequence,
   ) : _transport = _configuration.transport ?? DefaultRumTransport(),
-      _endpoints = <RumEventKind, Uri>{
-        for (final RumEventKind kind in RumEventKind.values)
+      _endpoints = <RumUploadKind, Uri>{
+        for (final RumUploadKind kind in RumUploadKind.values)
           kind: _configuration.endpoint(kind),
       },
       _storageKey =
@@ -51,13 +60,18 @@ final class EventTransport {
   final RumPersistence _persistence;
   final int Function(String sessionId) _nextReplaySequence;
   final RumTransport _transport;
-  final Map<RumEventKind, Uri> _endpoints;
+  final Map<RumUploadKind, Uri> _endpoints;
   final String _storageKey;
   final List<_QueuedEvent> _eventQueue = <_QueuedEvent>[];
   final List<_ReplayEnvelope> _replayQueue = <_ReplayEnvelope>[];
   final List<_ReplaySegment> _replaySegments = <_ReplaySegment>[];
   final Map<String, int> _pendingDropReasons = <String, int>{};
+  final Map<RumUploadKind, int> _pausedUntilMicros = <RumUploadKind, int>{};
   final Random _random = Random();
+
+  /// Called before each periodic flush so the client can report the active
+  /// view's latest state.
+  void Function()? onFlushTick;
 
   Timer? _eventTimer;
   Timer? _replayTimer;
@@ -70,6 +84,7 @@ final class EventTransport {
   void start() {
     if (_stopped) return;
     _eventTimer ??= Timer.periodic(_configuration.flushInterval, (_) {
+      _tick();
       unawaited(_flush(force: false));
     });
     _replayTimer ??= Timer.periodic(_configuration.replayFlushInterval, (_) {
@@ -78,25 +93,31 @@ final class EventTransport {
     if (_totalQueued > 0) unawaited(_flush(force: false));
   }
 
-  bool enqueue(RumEventKind kind, RumContext event) {
-    if (_stopped || kind == RumEventKind.replay) return false;
-    final int? bytes = _serializedBytes(event, '${kind.wireName} event');
+  /// Queues one contract event. A later revision of a view replaces the
+  /// revisions of that view that are still waiting: counts are cumulative, so
+  /// only the highest revision matters to the receiver.
+  bool enqueue(RumContext event) {
+    if (_stopped) return false;
+    final Object? type = event['type'];
+    final int? bytes = _serializedBytes(event, '$type event');
     if (bytes == null) return false;
-    if (bytes > _configuration.maxQueueBytes) {
+    if (bytes > _maximumEventBytes || bytes > _configuration.maxQueueBytes) {
       _recordDrop('event_too_large');
       return false;
     }
     final _QueuedEvent queued = _QueuedEvent(
-      kind: kind,
       event: event,
       bytes: bytes,
       createdAtMicros: nowMicros(),
     );
+    final String? viewId = queued.viewId;
+    if (viewId != null) {
+      _eventQueue.removeWhere((_QueuedEvent item) => item.viewId == viewId);
+    }
     if (!_makeCapacity(queued.bytes)) return false;
     _eventQueue.add(queued);
     _schedulePersist();
-    if (_eventQueue.where((_QueuedEvent item) => item.kind == kind).length >=
-        _configuration.batchSize) {
+    if (_eventQueue.length >= _configuration.batchSize) {
       unawaited(_flush(force: false));
     }
     return true;
@@ -158,6 +179,19 @@ final class EventTransport {
     return result;
   }
 
+  void _tick() {
+    try {
+      onFlushTick?.call();
+    } on Object catch (error, stackTrace) {
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM view report failed',
+        error,
+        stackTrace,
+      );
+    }
+  }
+
   Future<RumFlushResult> _flush({required bool force}) {
     final Future<RumFlushResult>? active = _activeFlush;
     if (active != null) {
@@ -189,45 +223,43 @@ final class EventTransport {
     _createReplaySegments();
     await persistNow();
 
-    for (final RumEventKind kind in _ingestKinds) {
-      while (true) {
-        if (_deadlineReached(deadline)) {
-          stats.timedOut = true;
-          break;
-        }
-        final int now = nowMicros();
-        final List<_QueuedEvent> eligible = _eventQueue
-            .where(
-              (_QueuedEvent item) =>
-                  item.kind == kind && (force || item.nextAttemptMicros <= now),
-            )
-            .take(_configuration.batchSize)
-            .toList(growable: false);
-        if (eligible.isEmpty) break;
-        final List<_QueuedEvent> chunk = _fitEventChunk(eligible);
-        final _SendResult result = await _send(
-          kind,
-          chunk.map((_QueuedEvent item) => item.event).toList(growable: false),
-          deadline,
-        );
-        if (result == _SendResult.ok) {
-          _eventQueue.removeWhere(chunk.contains);
-          stats.accepted += chunk.length;
-        } else if (result == _SendResult.drop) {
-          _eventQueue.removeWhere(chunk.contains);
-          stats.drop('non_retryable', chunk.length);
-        } else {
-          _scheduleEventRetry(chunk);
-          stats.retried += chunk.length;
-          break;
-        }
-        await persistNow();
+    while (!_paused(RumUploadKind.events)) {
+      if (_deadlineReached(deadline)) {
+        stats.timedOut = true;
+        break;
       }
-      if (stats.timedOut) break;
+      final int now = nowMicros();
+      final List<_QueuedEvent> eligible = _eventQueue
+          .where((_QueuedEvent item) => force || item.nextAttemptMicros <= now)
+          .take(_configuration.batchSize)
+          .toList(growable: false);
+      if (eligible.isEmpty) break;
+      final List<_QueuedEvent> chunk = _fitEventChunk(eligible);
+      final _SendOutcome outcome = await _send(
+        RumUploadKind.events,
+        chunk.map((_QueuedEvent item) => item.event).toList(growable: false),
+        deadline,
+      );
+      if (outcome.result == _SendResult.ok) {
+        _eventQueue.removeWhere(chunk.contains);
+        final int rejected = _reportRejections(chunk, outcome.answer);
+        stats.accepted +=
+            outcome.answer.accepted ?? max(0, chunk.length - rejected);
+        if (rejected > 0) stats.drop('rejected', rejected);
+      } else if (outcome.result == _SendResult.drop) {
+        _eventQueue.removeWhere(chunk.contains);
+        stats.drop('non_retryable', chunk.length);
+      } else {
+        _scheduleEventRetry(chunk, outcome.retryAfter);
+        stats.retried += chunk.length;
+        if (_deadlineReached(deadline)) stats.timedOut = true;
+        break;
+      }
+      await persistNow();
     }
 
     if (!stats.timedOut) {
-      while (_replaySegments.isNotEmpty) {
+      while (_replaySegments.isNotEmpty && !_paused(RumUploadKind.replay)) {
         if (_deadlineReached(deadline)) {
           stats.timedOut = true;
           break;
@@ -239,22 +271,28 @@ final class EventTransport {
             )
             .firstOrNull;
         if (segment == null) break;
-        final _SendResult result =
-            await _send(RumEventKind.replay, <String, Object?>{
+        final _SendOutcome outcome =
+            await _send(RumUploadKind.replay, <String, Object?>{
               'application': _configuration.applicationId,
               'session_id': segment.sessionId,
               'seq': segment.sequence,
               'events': segment.events,
+              // A segment has no event to say where its session runs, and what
+              // the application keeps of its sessions can depend on it.
+              'service': _configuration.service,
+              'env': ?_configuration.env,
+              'version': _configuration.version,
             }, deadline);
-        if (result == _SendResult.ok) {
+        if (outcome.result == _SendResult.ok) {
           _replaySegments.remove(segment);
           stats.accepted += segment.events.length;
-        } else if (result == _SendResult.drop) {
+        } else if (outcome.result == _SendResult.drop) {
           _replaySegments.remove(segment);
           stats.drop('non_retryable', segment.events.length);
         } else {
-          _scheduleReplayRetry(segment);
+          _scheduleReplayRetry(segment, outcome.retryAfter);
           stats.retried += segment.events.length;
+          if (_deadlineReached(deadline)) stats.timedOut = true;
           break;
         }
         await persistNow();
@@ -313,8 +351,8 @@ final class EventTransport {
     }
   }
 
-  Future<_SendResult> _send(
-    RumEventKind kind,
+  Future<_SendOutcome> _send(
+    RumUploadKind kind,
     Object body,
     DateTime deadline,
   ) async {
@@ -328,18 +366,20 @@ final class EventTransport {
         error,
         stackTrace,
       );
-      return _SendResult.drop;
+      return const _SendOutcome(_SendResult.drop);
     }
-    if (kind == RumEventKind.replay &&
+    if (kind == RumUploadKind.replay &&
         _jsonSize(body) > _maximumReplayRequestBytes) {
       reportDiagnostic(
         _configuration.onError,
         'RUM replay upload dropped: segment exceeds 8 MiB',
       );
-      return _SendResult.drop;
+      return const _SendOutcome(_SendResult.drop);
     }
     final Duration remaining = deadline.difference(DateTime.now());
-    if (remaining <= Duration.zero) return _SendResult.retry;
+    if (remaining <= Duration.zero) {
+      return const _SendOutcome(_SendResult.retry);
+    }
     final Duration timeout = remaining < _configuration.requestTimeout
         ? remaining
         : _configuration.requestTimeout;
@@ -352,19 +392,35 @@ final class EventTransport {
               headers: <String, String>{
                 'authorization': 'Bearer ${_configuration.clientToken}',
                 'content-type': 'application/json',
-                'x-molesignal-application-id': _configuration.applicationId,
-                'x-molesignal-rum': 'molesignal_flutter/0.3.0',
               },
               kind: kind,
+              compress:
+                  kind == RumUploadKind.events &&
+                  _configuration.compressRequests,
             ),
           )
           .timeout(timeout);
-      if (response.ok) return _SendResult.ok;
+      if (response.ok) {
+        return _SendOutcome(
+          _SendResult.ok,
+          answer: kind == RumUploadKind.events
+              ? parseUploadAnswer(response.body)
+              : const UploadAnswer(),
+        );
+      }
       reportDiagnostic(
         _configuration.onError,
-        'RUM ${kind.wireName} upload rejected with HTTP ${response.status}',
+        'RUM ${kind.wireName} upload rejected with HTTP ${response.status}'
+        '${_excerpt(response.body)}',
       );
-      return _retryable(response.status) ? _SendResult.retry : _SendResult.drop;
+      if (!_retryable(response.status)) {
+        return const _SendOutcome(_SendResult.drop);
+      }
+      final Duration? retryAfter = retryAfterOf(response, DateTime.now());
+      if (retryAfter != null) {
+        _pausedUntilMicros[kind] = nowMicros() + retryAfter.inMicroseconds;
+      }
+      return _SendOutcome(_SendResult.retry, retryAfter: retryAfter);
     } on TimeoutException catch (error, stackTrace) {
       reportDiagnostic(
         _configuration.onError,
@@ -372,7 +428,7 @@ final class EventTransport {
         error,
         stackTrace,
       );
-      return _SendResult.retry;
+      return const _SendOutcome(_SendResult.retry);
     } on Object catch (error, stackTrace) {
       reportDiagnostic(
         _configuration.onError,
@@ -380,44 +436,76 @@ final class EventTransport {
         error,
         stackTrace,
       );
-      return _SendResult.retry;
+      return const _SendOutcome(_SendResult.retry);
     }
+  }
+
+  /// Reports every event the receiver refused. Refused events are never
+  /// retried: sending the same bytes again cannot make them valid.
+  int _reportRejections(List<_QueuedEvent> chunk, UploadAnswer answer) {
+    final Set<int> indexes = <int>{};
+    for (final RejectedEvent rejection in answer.rejected) {
+      if (rejection.index < 0 || rejection.index >= chunk.length) continue;
+      if (!indexes.add(rejection.index)) continue;
+      if (indexes.length > _maximumRejectionDiagnostics) continue;
+      final Object? type = chunk[rejection.index].event['type'];
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM $type event rejected by the receiver: '
+        '${rejection.reason.isEmpty ? 'no reason given' : rejection.reason}',
+      );
+    }
+    if (indexes.length > _maximumRejectionDiagnostics) {
+      reportDiagnostic(
+        _configuration.onError,
+        'RUM ${indexes.length - _maximumRejectionDiagnostics} more events '
+        'rejected by the receiver',
+      );
+    }
+    return indexes.length;
   }
 
   List<_QueuedEvent> _fitEventChunk(List<_QueuedEvent> candidates) {
     final List<_QueuedEvent> result = <_QueuedEvent>[];
+    int bytes = 2;
     for (final _QueuedEvent candidate in candidates) {
-      final List<_QueuedEvent> next = <_QueuedEvent>[...result, candidate];
-      final int bytes = _jsonSize(
-        next.map((_QueuedEvent item) => item.event).toList(),
-      );
-      if (result.isNotEmpty && bytes > _maximumBatchBytes) break;
+      final int next = bytes + candidate.bytes + (result.isEmpty ? 0 : 1);
+      if (result.isNotEmpty && next > _maximumBatchBytes) break;
       result.add(candidate);
+      bytes = next;
     }
     return result;
   }
 
-  void _scheduleEventRetry(List<_QueuedEvent> items) {
+  bool _paused(RumUploadKind kind) =>
+      (_pausedUntilMicros[kind] ?? 0) > nowMicros();
+
+  void _scheduleEventRetry(List<_QueuedEvent> items, Duration? retryAfter) {
     for (final _QueuedEvent item in items) {
       item.attempts += 1;
-      item.nextAttemptMicros = nowMicros() + _retryDelay(item.attempts);
+      item.nextAttemptMicros =
+          nowMicros() + _retryDelay(item.attempts, retryAfter);
     }
     _schedulePersist();
   }
 
-  void _scheduleReplayRetry(_ReplaySegment segment) {
+  void _scheduleReplayRetry(_ReplaySegment segment, Duration? retryAfter) {
     segment.attempts += 1;
-    segment.nextAttemptMicros = nowMicros() + _retryDelay(segment.attempts);
+    segment.nextAttemptMicros =
+        nowMicros() + _retryDelay(segment.attempts, retryAfter);
     _schedulePersist();
   }
 
-  int _retryDelay(int attempts) {
+  /// Exponential backoff with jitter, never shorter than the receiver's
+  /// `Retry-After`.
+  int _retryDelay(int attempts, Duration? retryAfter) {
     final int shift = (attempts - 1).clamp(0, 20);
     final int base = _configuration.retryInitialDelay.inMicroseconds;
     final int cap = _configuration.retryMaxDelay.inMicroseconds;
     final int exponential = min(cap, base * (1 << shift));
     final double jitter = 0.8 + _random.nextDouble() * 0.4;
-    return max(1, (exponential * jitter).round());
+    final int backoff = max(1, (exponential * jitter).round());
+    return max(backoff, retryAfter?.inMicroseconds ?? 0);
   }
 
   bool _makeCapacity(int incomingBytes) {
@@ -514,7 +602,7 @@ final class EventTransport {
         return;
       }
       final Map<String, Object?> state = <String, Object?>{
-        'version': 1,
+        'version': _stateVersion,
         'events': _eventQueue
             .map((_QueuedEvent item) => item.toJson())
             .toList(growable: false),
@@ -544,7 +632,9 @@ final class EventTransport {
       final Object? decoded = jsonDecode(raw);
       if (decoded is! Map<String, dynamic>) return;
       final Object? rawEvents = decoded['events'];
-      if (rawEvents is List<dynamic>) {
+      // A queue written by an older SDK holds events for endpoints that no
+      // longer exist; they cannot be sent and are discarded.
+      if (decoded['version'] == _stateVersion && rawEvents is List<dynamic>) {
         for (final Object? value in rawEvents) {
           final _QueuedEvent? item = _QueuedEvent.fromJson(value);
           if (item != null) _eventQueue.add(item);
@@ -628,23 +718,23 @@ RumFlushResult _mergeFlushResults(RumFlushResult first, RumFlushResult second) {
 
 final class _QueuedEvent {
   _QueuedEvent({
-    required this.kind,
     required this.event,
     required this.bytes,
     required this.createdAtMicros,
     this.attempts = 0,
     this.nextAttemptMicros = 0,
-  });
+  }) : viewId = _viewIdOf(event);
 
-  final RumEventKind kind;
   final RumContext event;
   final int bytes;
   final int createdAtMicros;
+
+  /// `view.id` of a `view` event, which later revisions replace.
+  final String? viewId;
   int attempts;
   int nextAttemptMicros;
 
   Map<String, Object?> toJson() => <String, Object?>{
-    'kind': kind.wireName,
     'event': event,
     'bytes': bytes,
     'created_at_micros': createdAtMicros,
@@ -654,21 +744,29 @@ final class _QueuedEvent {
 
   static _QueuedEvent? fromJson(Object? value) {
     if (value is! Map<String, dynamic>) return null;
-    final RumEventKind? kind = _kind(value['kind']);
     final RumContext? event = _context(value['event']);
     final int? bytes = _positiveInt(value['bytes']);
     final int? created = _positiveInt(value['created_at_micros']);
-    if (kind == null || event == null || bytes == null || created == null) {
+    if (event == null ||
+        !_eventTypes.contains(event['type']) ||
+        bytes == null ||
+        created == null) {
       return null;
     }
     return _QueuedEvent(
-      kind: kind,
       event: event,
       bytes: bytes,
       createdAtMicros: created,
       attempts: _nonNegativeInt(value['attempts']),
       nextAttemptMicros: _nonNegativeInt(value['next_attempt_micros']),
     );
+  }
+
+  static String? _viewIdOf(RumContext event) {
+    if (event['type'] != 'view') return null;
+    final Object? view = event['view'];
+    final Object? id = view is Map<dynamic, dynamic> ? view['id'] : null;
+    return id is String ? id : null;
   }
 }
 
@@ -810,6 +908,18 @@ final class _QueueHead {
 
 enum _SendResult { ok, drop, retry }
 
+final class _SendOutcome {
+  const _SendOutcome(
+    this.result, {
+    this.answer = const UploadAnswer(),
+    this.retryAfter,
+  });
+
+  final _SendResult result;
+  final UploadAnswer answer;
+  final Duration? retryAfter;
+}
+
 List<List<T>> _chunkBySerializedSize<T>(
   List<T> items,
   int maximumItems,
@@ -833,20 +943,18 @@ List<List<T>> _chunkBySerializedSize<T>(
   return chunks;
 }
 
+/// Network failures, request timeouts, rate limiting, and server errors are
+/// worth another attempt; any other refusal will not change.
 bool _retryable(int status) =>
-    status == 0 ||
-    status == 408 ||
-    status == 425 ||
-    status == 429 ||
-    status >= 500;
+    status == 0 || status == 408 || status == 429 || status >= 500;
 
 bool _deadlineReached(DateTime deadline) => !DateTime.now().isBefore(deadline);
 
-RumEventKind? _kind(Object? value) {
-  for (final RumEventKind kind in _ingestKinds) {
-    if (kind.wireName == value) return kind;
-  }
-  return null;
+/// A short, sanitized quote of an error body for diagnostics.
+String _excerpt(String? body) {
+  final String text = (body ?? '').trim();
+  if (text.isEmpty) return '';
+  return ': ${sanitizeText(text.length > 200 ? text.substring(0, 200) : text)}';
 }
 
 RumContext? _context(Object? value) => value is Map<dynamic, dynamic>

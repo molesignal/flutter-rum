@@ -1,3 +1,4 @@
+import 'environment/device_info.dart';
 import 'internal/identifiers.dart';
 import 'internal/runtime_build.dart';
 import 'models.dart';
@@ -41,6 +42,7 @@ final class RumConfiguration {
     this.service,
     this.env,
     this.version,
+    this.buildVersion,
     this.platform,
     this.architecture,
     this.debugId,
@@ -56,8 +58,8 @@ final class RumConfiguration {
     this.trackResources = true,
     this.trackAppLifecycle = true,
     this.trackLongTasks = true,
-    this.trackLongFrames,
     this.trackViewPerformance = true,
+    this.trackDeviceInfo = true,
     this.longFrameThreshold = const Duration(milliseconds: 100),
     this.trackAnonymousUser = true,
     this.trackUrlQueryString = false,
@@ -75,7 +77,8 @@ final class RumConfiguration {
     this.retryMaxDelay = const Duration(minutes: 1),
     this.requestTimeout = const Duration(seconds: 15),
     this.flushTimeout = const Duration(seconds: 20),
-    this.sessionInactivityTimeout = const Duration(minutes: 30),
+    this.compressRequests = true,
+    this.sessionInactivityTimeout = const Duration(minutes: 15),
     this.maxSessionDuration = const Duration(hours: 4),
     this.actionDeduplicationWindow = const Duration(milliseconds: 300),
     this.frozenFrameThreshold = const Duration(milliseconds: 700),
@@ -83,26 +86,38 @@ final class RumConfiguration {
     this.onError,
     this.transport,
     this.persistence,
+    this.deviceInfoProvider,
   });
 
+  /// Identifier of the application the [clientToken] is bound to; sent as
+  /// `application.id`, which the receiver rejects when it names another one.
   final String applicationId;
   final String clientToken;
   final String site;
   final String? service;
   final String? env;
+
+  /// Application version (`version`); also the release that debug artifacts
+  /// are uploaded under.
   final String? version;
 
+  /// Build number or code (`build_version`), for example the `+4` of `1.2.3+4`.
+  final String? buildVersion;
+
   /// Artifact upload `platform`. Defaults to `android`, `ios`, or `flutter`
-  /// (for Flutter Web and unsupported desktop targets).
+  /// (for Flutter Web and unsupported desktop targets). It selects how stack
+  /// traces are parsed.
   final String? platform;
 
   /// Artifact upload architecture, for example `arm64`, `x86_64`, or
-  /// `javascript`. Supply this explicitly for release artifacts.
+  /// `javascript`; sent as `device.architecture`. Supply this explicitly for
+  /// release artifacts.
   final String? architecture;
 
-  /// Stable build identifier shared with `/api/v1/debug-artifacts` uploads.
-  /// A deterministic fallback is generated when omitted, but release builds
-  /// should provide their CI build ID explicitly.
+  /// Stable build identifier shared with `/api/v1/debug-artifacts` uploads;
+  /// sent as `build_id` and as each frame's `debug_id`. A deterministic
+  /// fallback is generated when omitted, but release builds should provide
+  /// their CI build ID explicitly.
   final String? debugId;
   final RumUser? user;
   final RumContext globalContext;
@@ -115,20 +130,26 @@ final class RumConfiguration {
   final RumSessionReplayConfiguration sessionReplay;
   final bool trackUserInteractions;
 
-  /// Defaults to [trackUserInteractions].
+  /// Rage and error taps. Defaults to [trackUserInteractions].
   final bool? trackFrustrations;
   final bool trackFlutterErrors;
   final bool trackPlatformErrors;
   final bool trackResources;
   final bool trackAppLifecycle;
+
+  /// Reports slow and frozen Flutter frames as `long_task` events.
   final bool trackLongTasks;
 
-  /// Backwards-compatible alias for [trackLongTasks].
-  @Deprecated('Use trackLongTasks instead.')
-  final bool? trackLongFrames;
-
-  /// Records Flutter first-render timing for each view.
+  /// Reports startup time, first build, build/raster time, refresh rate, slow
+  /// and frozen frame rates, and memory on each view.
   final bool trackViewPerformance;
+
+  /// Reads device brand, model, OS version, memory, battery and connectivity
+  /// through `device_info_plus`, `battery_plus` and `connectivity_plus`. When
+  /// off, only what Flutter itself exposes is sent.
+  final bool trackDeviceInfo;
+
+  /// Frames at least this long are `long_task` events.
   final Duration longFrameThreshold;
   final bool trackAnonymousUser;
   final bool trackUrlQueryString;
@@ -151,6 +172,10 @@ final class RumConfiguration {
   final Duration retryMaxDelay;
   final Duration requestTimeout;
   final Duration flushTimeout;
+
+  /// Sends event batches with `Content-Encoding: gzip` where `dart:io` is
+  /// available.
+  final bool compressRequests;
   final Duration sessionInactivityTimeout;
   final Duration maxSessionDuration;
   final Duration actionDeduplicationWindow;
@@ -160,6 +185,9 @@ final class RumConfiguration {
   final RumDiagnosticHandler? onError;
   final RumTransport? transport;
   final RumPersistence? persistence;
+
+  /// Replaces the built-in device, OS, battery and connectivity reader.
+  final RumDeviceInfoProvider? deviceInfoProvider;
 }
 
 /// Validated and bounded configuration used by the implementation.
@@ -171,6 +199,7 @@ final class NormalizedRumConfiguration {
     required this.service,
     required this.env,
     required this.version,
+    required this.buildVersion,
     required this.platform,
     required this.architecture,
     required this.debugId,
@@ -185,8 +214,9 @@ final class NormalizedRumConfiguration {
     required this.trackPlatformErrors,
     required this.trackResources,
     required this.trackAppLifecycle,
-    required this.trackLongFrames,
+    required this.trackLongTasks,
     required this.trackViewPerformance,
+    required this.trackDeviceInfo,
     required this.longFrameThreshold,
     required this.trackAnonymousUser,
     required this.trackUrlQueryString,
@@ -204,6 +234,7 @@ final class NormalizedRumConfiguration {
     required this.retryMaxDelay,
     required this.requestTimeout,
     required this.flushTimeout,
+    required this.compressRequests,
     required this.sessionInactivityTimeout,
     required this.maxSessionDuration,
     required this.actionDeduplicationWindow,
@@ -212,6 +243,7 @@ final class NormalizedRumConfiguration {
     required this.onError,
     required this.transport,
     required this.persistence,
+    required this.deviceInfoProvider,
   });
 
   factory NormalizedRumConfiguration.from(RumConfiguration config) {
@@ -238,23 +270,24 @@ final class NormalizedRumConfiguration {
       );
     }
     final Uri site = _normalizeSite(_required(config.site, 'site'));
-    final String service = _optional(config.service) ?? applicationId;
-    final String version = _optional(config.version) ?? 'unknown';
+    final String service = _label(_optional(config.service) ?? applicationId);
+    final String version = _label(_optional(config.version) ?? 'unknown');
     final String platform = _normalizePlatform(
       _optional(config.platform) ?? detectRumPlatform(),
     );
     final String architecture = normalizeRumArchitecture(
       _optional(config.architecture) ?? detectRumArchitecture(),
     );
-    final String debugId =
-        _optional(config.debugId) ??
-        _fallbackDebugId(
-          applicationId,
-          service,
-          version,
-          platform,
-          architecture,
-        );
+    final String debugId = _label(
+      _optional(config.debugId) ??
+          _fallbackDebugId(
+            applicationId,
+            service,
+            version,
+            platform,
+            architecture,
+          ),
+    );
     final RumUser? user = config.user;
     if (user != null && user.id.trim().isEmpty) {
       throw ArgumentError.value(
@@ -269,8 +302,9 @@ final class NormalizedRumConfiguration {
       clientToken: clientToken,
       site: site,
       service: service,
-      env: _optional(config.env),
+      env: _optionalLabel(config.env),
       version: version,
+      buildVersion: _optionalLabel(config.buildVersion),
       platform: platform,
       architecture: architecture,
       debugId: debugId,
@@ -286,8 +320,9 @@ final class NormalizedRumConfiguration {
       trackPlatformErrors: config.trackPlatformErrors,
       trackResources: config.trackResources,
       trackAppLifecycle: config.trackAppLifecycle,
-      trackLongFrames: config.trackLongFrames ?? config.trackLongTasks,
+      trackLongTasks: config.trackLongTasks,
       trackViewPerformance: config.trackViewPerformance,
+      trackDeviceInfo: config.trackDeviceInfo,
       longFrameThreshold: _duration(
         config.longFrameThreshold,
         const Duration(milliseconds: 100),
@@ -349,9 +384,10 @@ final class NormalizedRumConfiguration {
         const Duration(seconds: 1),
         const Duration(minutes: 5),
       ),
+      compressRequests: config.compressRequests,
       sessionInactivityTimeout: _duration(
         config.sessionInactivityTimeout,
-        const Duration(minutes: 30),
+        const Duration(minutes: 15),
         const Duration(minutes: 1),
         const Duration(hours: 24),
       ),
@@ -377,6 +413,7 @@ final class NormalizedRumConfiguration {
       onError: config.onError,
       transport: config.transport,
       persistence: config.persistence,
+      deviceInfoProvider: config.deviceInfoProvider,
     );
   }
 
@@ -386,6 +423,7 @@ final class NormalizedRumConfiguration {
   final String service;
   final String? env;
   final String version;
+  final String? buildVersion;
   final String platform;
   final String architecture;
   final String debugId;
@@ -400,8 +438,9 @@ final class NormalizedRumConfiguration {
   final bool trackPlatformErrors;
   final bool trackResources;
   final bool trackAppLifecycle;
-  final bool trackLongFrames;
+  final bool trackLongTasks;
   final bool trackViewPerformance;
+  final bool trackDeviceInfo;
   final Duration longFrameThreshold;
   final bool trackAnonymousUser;
   final bool trackUrlQueryString;
@@ -419,6 +458,7 @@ final class NormalizedRumConfiguration {
   final Duration retryMaxDelay;
   final Duration requestTimeout;
   final Duration flushTimeout;
+  final bool compressRequests;
   final Duration sessionInactivityTimeout;
   final Duration maxSessionDuration;
   final Duration actionDeduplicationWindow;
@@ -427,15 +467,13 @@ final class NormalizedRumConfiguration {
   final RumDiagnosticHandler? onError;
   final RumTransport? transport;
   final RumPersistence? persistence;
+  final RumDeviceInfoProvider? deviceInfoProvider;
 
-  Uri endpoint(RumEventKind kind) {
+  /// `{site}/api/v1/rum/events` or `{site}/api/v1/rum/replay`. The path is
+  /// completed from whatever prefix [site] already carries.
+  Uri endpoint(RumUploadKind kind) {
     String path = site.path.replaceFirst(RegExp(r'/+$'), '');
-    final String suffix = switch (kind) {
-      RumEventKind.session => 'sessions',
-      RumEventKind.action => 'actions',
-      RumEventKind.error => 'errors',
-      RumEventKind.replay => 'replay',
-    };
+    final String suffix = kind.wireName;
     if (path.endsWith('/api/v1/rum')) {
       path = '$path/$suffix';
     } else if (path.endsWith('/api/v1')) {
@@ -477,6 +515,15 @@ String _required(String value, String field) {
 String? _optional(String? value) {
   final String result = value?.trim() ?? '';
   return result.isEmpty ? null : result;
+}
+
+/// The contract's `label`: 1..256 characters.
+String _label(String value) =>
+    value.length <= 256 ? value : value.substring(0, 256);
+
+String? _optionalLabel(String? value) {
+  final String? result = _optional(value);
+  return result == null ? null : _label(result);
 }
 
 Uri _normalizeSite(String value) {

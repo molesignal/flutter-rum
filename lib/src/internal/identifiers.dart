@@ -2,24 +2,38 @@ import 'dart:math';
 
 int nowMicros() => DateTime.now().microsecondsSinceEpoch;
 
-String generateId(String prefix) {
-  Random random;
+int nowMillis() => DateTime.now().millisecondsSinceEpoch;
+
+final Random _random = _createRandom();
+
+Random _createRandom() {
   try {
-    random = Random.secure();
+    return Random.secure();
   } on Object {
-    random = Random();
+    return Random();
   }
-  final StringBuffer value = StringBuffer(prefix)..write('_');
-  for (int index = 0; index < 16; index += 1) {
-    value.write(random.nextInt(256).toRadixString(16).padLeft(2, '0'));
-  }
-  return value.toString();
+}
+
+/// A random RFC 4122 version 4 UUID, accepted by the contract's `identifier`.
+String generateUuid() {
+  final List<int> bytes = List<int>.generate(
+    16,
+    (int _) => _random.nextInt(256),
+    growable: false,
+  );
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  String hex(int start, int end) => bytes
+      .sublist(start, end)
+      .map((int byte) => byte.toRadixString(16).padLeft(2, '0'))
+      .join();
+  return '${hex(0, 4)}-${hex(4, 6)}-${hex(6, 8)}-${hex(8, 10)}-${hex(10, 16)}';
 }
 
 bool sample(double rate) {
   if (rate <= 0) return false;
   if (rate >= 100) return true;
-  return Random().nextDouble() * 100 < rate;
+  return _random.nextDouble() * 100 < rate;
 }
 
 String fnv1a(String value) {

@@ -127,7 +127,7 @@ void main() {
             respond: (RumTransportRequest request) => RumTransportResponse(
               ok: false,
               status: status,
-              body: '{"error":"invalid token msrum_secret"}',
+              body: '{"error":"invalid token mspat-secret"}',
             ),
           );
           final MoleSignalRumClient client = await startClient(

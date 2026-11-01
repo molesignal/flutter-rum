@@ -27,7 +27,7 @@ is the fixture entry point.
 
 ```bash
 export MOLESIGNAL_APPLICATION_ID=checkout-mobile
-export MOLESIGNAL_RUM_TOKEN=msrum_... # application-bound public token
+export MOLESIGNAL_RUM_TOKEN=mspat-... # application-bound public token
 export MOLESIGNAL_SITE=https://molesignal.example.com
 export MOLESIGNAL_SERVICE=checkout-app
 export MOLESIGNAL_VERSION=1.4.0+42

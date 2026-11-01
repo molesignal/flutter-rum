@@ -34,7 +34,7 @@ raster、刷新率、慢帧/冻结帧与内存数据。
 
 ```yaml
 dependencies:
-  molesignal_flutter: ^0.2.0
+  molesignal_flutter: ^0.3.0
 ```
 
 设备品牌、型号、系统版本、电量与网络状态通过 `device_info_plus`、`battery_plus`、
@@ -87,7 +87,7 @@ Future<void> main() async {
 加入根组件而自动录屏。使用 Router/go_router 时，将 `RumNavigationObserver` 传给对应的
 `navigatorObservers`，或者在路由状态变化时调用 `rum.startView`。
 
-`applicationId` 必须是 `clientToken`（`msrum_…`）所绑定的应用；它作为
+`applicationId` 必须是 `clientToken`（`mspat-…`）所绑定的应用；它作为
 `application.id` 发送，接入端会拒绝指向其他应用的事件。
 
 ## 会话
@@ -339,8 +339,8 @@ remaining、timedOut 和各丢弃原因。`stop()` 会对当前 View 做最后�
 - 事件、诊断、Replay metadata 和离线队列不会保存 credential、Authorization、URL
   user info、敏感 query 值、请求/响应 body 或开发机绝对路径；
 - `clientToken` 会随 App 下发，必须视为公开凭证。请使用数据源接入向导生成的
-  应用绑定 `msrum_<16 位字母数字>_<32 位字母数字>` Client Token。本地保存非秘密
-  application binding 以尽早发现误复用，服务端仍是最终隔离边界；
+  应用绑定 Client Token。所有 MoleSignal Token 都是 `mspat-<36 位小写字母数字>`，SDK
+  无法区分。本地保存非秘密 application binding 以尽早发现误复用，服务端仍是最终隔离边界；
 - Shared Preferences 不是加密保险箱。队列内容已经过隐私清洗；要求本地静态加密的
   应用应提供自己的加密 `RumPersistence`。
 
@@ -362,6 +362,11 @@ flutter test
 测试会用共享的事件契约（`v1.schema.json`）校验 SDK 发出的每一条事件。把 `MOLESIGNAL_CONTRACTS`
 指向服务端仓库的 `contracts/rum/events` 目录；默认是 `../molesignal/contracts/rum/events`。
 找不到时，契约相关测试会带着这条说明被跳过。
+
+## 从 0.2 升级
+
+`clientToken` 改为 `mspat-<36 位小写字母数字>` 格式。旧格式 `msrum_<16>_<32>` 的 Token 在客户端启动时就会被拒绝。
+新格式需要能签发它的 MoleSignal 服务端，请在那里新建 Client Token。
 
 ## 从 0.1 升级
 

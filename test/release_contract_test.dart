@@ -155,7 +155,7 @@ void main() {
   test(
     'credential format and local application binding fail clearly',
     () async {
-      const String malformed = 'msrum_this-is-not-valid';
+      const String malformed = 'mspat-this-is-not-valid';
       Object? failure;
       try {
         await MoleSignalRumClient.create(
@@ -172,7 +172,7 @@ void main() {
       expect(failure, isA<ArgumentError>());
       expect(
         failure.toString(),
-        contains('msrum_<16 alphanumeric>_<32 alphanumeric>'),
+        contains('mspat-<36 lowercase alphanumeric>'),
       );
       expect(failure.toString(), isNot(contains(malformed)));
 

@@ -253,12 +253,12 @@ final class NormalizedRumConfiguration {
     );
     final String clientToken = _required(config.clientToken, 'clientToken');
     if (!RegExp(
-      r'^msrum_[A-Za-z0-9]{16}_[A-Za-z0-9]{32}$',
+      r'^mspat-[0-9a-z]{36}$',
     ).hasMatch(clientToken)) {
       throw ArgumentError.value(
         '[Redacted]',
         'clientToken',
-        'must match msrum_<16 alphanumeric>_<32 alphanumeric>',
+        'must match mspat-<36 lowercase alphanumeric>',
       );
     }
     if (applicationId.length > 128 ||

@@ -98,7 +98,7 @@ class RecordingTransport extends RumTransport {
     if (request.url.path != '/api/v1/rum/events') {
       violations.add('events were sent to ${request.url.path}');
     }
-    if (!(request.headers['authorization'] ?? '').startsWith('Bearer msrum_')) {
+    if (!(request.headers['authorization'] ?? '').startsWith('Bearer mspat-')) {
       violations.add('missing Bearer application token');
     }
     final Object? decoded = jsonDecode(request.body);

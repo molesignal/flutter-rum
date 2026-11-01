@@ -1,7 +1,7 @@
 import 'package:molesignal_flutter/molesignal_flutter.dart';
 
 const String testClientToken =
-    'msrum_aB3kZ1xT9pQrU7nM_dFgHjKl8eRvNcWxYz4tBmEqPaS2vG6Qz';
+    'mspat-c16jb8m5zrzf174p8g8b7m5p4jz0kp9y1hxr';
 
 /// A configuration for tests: nothing global is installed, nothing is read from
 /// the device, and the periodic flush never fires on its own.

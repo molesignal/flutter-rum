@@ -8,7 +8,7 @@ final RegExp _sensitiveKey = RegExp(
 );
 
 final RegExp _rumCredential = RegExp(
-  r'\bmsrum_[A-Za-z0-9]{16}_[A-Za-z0-9]{32}\b',
+  r'\bmspat-[0-9a-z]{36}\b',
 );
 final RegExp _bearerCredential = RegExp(
   r'\bBearer\s+[^\s,;]+',

@@ -34,7 +34,7 @@ data.
 
 ```yaml
 dependencies:
-  molesignal_flutter: ^0.2.0
+  molesignal_flutter: ^0.3.0
 ```
 
 Device brand, model, OS version, battery level, and connectivity are read with
@@ -89,7 +89,7 @@ the first frame. Replay remains opt-in with a default sample rate of zero.
 Router-based apps can supply the observer through their router integration or
 call `startView`.
 
-`applicationId` must be the application the `clientToken` (`msrum_…`) is bound
+`applicationId` must be the application the `clientToken` (`mspat-…`) is bound
 to; it is sent as `application.id` and the receiver rejects events that name
 another application.
 
@@ -370,8 +370,9 @@ last activity, and replay sequence survive restart.
   request/response bodies, and developer-machine absolute paths are not stored
   in events, diagnostics, replay metadata, or the offline queue.
 - `clientToken` ships in the app and must be treated as public. Use the
-  application-bound `msrum_<16 alphanumeric>_<32 alphanumeric>` client token
-  created by the data-source guide. A non-secret local binding catches accidental
+  application-bound client token created by the data-source guide. Every
+  MoleSignal token has the form `mspat-<36 lowercase alphanumeric>`, so the SDK
+  cannot tell them apart. A non-secret local binding catches accidental
   reuse with a different application; the server remains authoritative.
 - Shared preferences are not an encrypted secret store. Queued payloads are
   already privacy-filtered; applications requiring encrypted-at-rest storage
@@ -399,6 +400,12 @@ The tests check every event the SDK sends against the shared event contract
 `contracts/rum/events` directory; the default is
 `../molesignal/contracts/rum/events`. When it cannot be found, the contract
 tests are skipped with that message.
+
+## Upgrading from 0.2
+
+`clientToken` takes the `mspat-<36 lowercase alphanumeric>` format. A token of
+the old `msrum_<16>_<32>` format is refused when the client starts. The new
+format needs a MoleSignal server that issues it; create a new client token there.
 
 ## Upgrading from 0.1
 

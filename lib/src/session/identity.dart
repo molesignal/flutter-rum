@@ -7,7 +7,8 @@ Future<void> validateCredentialApplicationBinding(
   NormalizedRumConfiguration configuration,
   RumPersistence persistence,
 ) async {
-  final String prefix = configuration.clientToken.split('_')[1];
+  // The ten characters after `mspat-`, which are not secret.
+  final String prefix = configuration.clientToken.substring(6, 16);
   final String key = 'molesignal_rum_credential_binding_${fnv1a(prefix)}';
   try {
     final String? existing = await persistence.read(key);

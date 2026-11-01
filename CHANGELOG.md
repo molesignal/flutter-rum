@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+### Breaking changes
+
+- `clientToken` takes the new token format, `mspat-<36 lowercase alphanumeric>`. A
+  token of the old `msrum_<16>_<32>` format is refused when the client starts. It
+  needs a MoleSignal server that issues the new format.
+
 ## 0.2.0
 
 The SDK now speaks the MoleSignal RUM event contract (`contracts/rum/events`).

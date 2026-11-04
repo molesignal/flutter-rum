@@ -68,7 +68,7 @@ void main() {
         final Map<String, dynamic> segment = _replaySegment(
           transport.replayRequests.single,
         );
-        expect(segment['session_id'], matches(RegExp(r'^[0-9a-f-]{36}$')));
+        expect(segment['sessionId'], matches(RegExp(r'^[0-9a-f-]{36}$')));
         expect(segment['application'], 'replay-mobile');
         expect(segment['seq'], 1);
         // A segment says where its session runs, as the events of the session do.

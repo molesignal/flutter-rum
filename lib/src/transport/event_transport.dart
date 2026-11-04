@@ -274,7 +274,7 @@ final class EventTransport {
         final _SendOutcome outcome =
             await _send(RumUploadKind.replay, <String, Object?>{
               'application': _configuration.applicationId,
-              'session_id': segment.sessionId,
+              'sessionId': segment.sessionId,
               'seq': segment.sequence,
               'events': segment.events,
               // A segment has no event to say where its session runs, and what
@@ -324,7 +324,7 @@ final class EventTransport {
             _configuration.replayBatchSize,
             (List<_ReplayEnvelope> items) => <String, Object?>{
               'application': _configuration.applicationId,
-              'session_id': entry.key,
+              'sessionId': entry.key,
               'seq': 0,
               'events': items
                   .map((_ReplayEnvelope item) => item.event)

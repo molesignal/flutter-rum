@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- A replay segment sends `sessionId`, in camelCase as the rest of the MoleSignal API. It needs a
+  MoleSignal server that reads it; the events keep their fields.
+
 ## 0.3.0
 
 ### Breaking changes

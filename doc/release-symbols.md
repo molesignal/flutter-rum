@@ -1,8 +1,8 @@
 # Flutter release symbols and build identity
 
 MoleSignal matches an error frame to a debug artifact with the same
-`application_id`, `service`, release (`version`), `kind`, `platform`,
-`architecture`, and `debug_id`. The values passed to `RumConfiguration` must
+`applicationId`, `service`, release (`version`), `kind`, `platform`,
+`architecture`, and `debugId`. The values passed to `RumConfiguration` must
 therefore come from the same CI build that produced the uploaded artifact.
 
 The SDK sends them with every error event as `application.id`, `service`,
@@ -30,7 +30,7 @@ const RumConfiguration(
 decides how stack traces are parsed. `architecture` (sent as
 `device.architecture`) is detected at runtime, but release pipelines should
 pass its canonical value explicitly: `arm64`, `armv7`, `x86_64`, `javascript`,
-or `wasm32`. Generate a new `debug_id` for every build whose code can differ, and
+or `wasm32`. Generate a new `debugId` for every build whose code can differ, and
 use exactly that value for every artifact belonging to that build. The
 architecture remains a separate matching key, so a multi-ABI build may use one
 build ID with one artifact per architecture.
@@ -71,7 +71,7 @@ Upload the generated `app.android-arm64.symbols` as:
 - `kind=flutter_symbols`
 - `platform=android`
 - `architecture=arm64`
-- `debug_id=$BUILD_ID`
+- `debugId=$BUILD_ID`
 
 Upload native plugin ELF symbols separately as
 `kind=android_native_symbols`. Forward native crash frames with

@@ -34,7 +34,7 @@ data.
 
 ```yaml
 dependencies:
-  molesignal_flutter: ^0.3.0
+  molesignal_flutter: ^0.4.0
 ```
 
 Device brand, model, OS version, battery level, and connectivity are read with
